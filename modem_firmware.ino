@@ -120,8 +120,11 @@ static uint32_t parseRGB(const char* s) {
   return strip.Color((uint8_t)r, (uint8_t)g, (uint8_t)b);
 }
 
-// Fill the whole strip with one color.
+// Fill the whole strip with one color. Gamma-correct here so every fill path
+// (incl. showColorScaled's fades, which call through this) lands on the LED's
+// perceptual curve rather than the raw linear ramp that washes colors out.
 static void showColor(uint32_t c) {
+  c = strip.gamma32(c);
   for (uint16_t i = 0; i < NUM_LIGHTS; i++) strip.setPixelColor(i, c);
   strip.show();
 }
@@ -153,6 +156,7 @@ static uint32_t colorOrFallback(uint32_t c) {
 // Spin frame: light LEDs 0..head so the lit arc grows as the head travels
 // around, leaving the whole board lit by the end of the lap.
 static void showSpin(uint32_t c, uint16_t head) {
+  c = strip.gamma32(c);                     // match showColor's perceptual curve
   strip.clear();
   for (uint16_t i = 0; i <= head && i < NUM_LIGHTS; i++)
     strip.setPixelColor(i, c);
@@ -378,7 +382,7 @@ void setup() {
 
   // Lights: init first, then sit at the idle (cleared) color.
   strip.begin();
-  strip.setBrightness(100);
+  strip.setBrightness(150);
   strip.clear();
   strip.show();
 
