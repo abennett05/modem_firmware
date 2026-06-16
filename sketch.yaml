@@ -1,0 +1,30 @@
+# sketch.yaml — arduino-cli build profile for modem_firmware
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Pins the board core + library versions so the firmware builds
+# reproducibly. nRF52840 (Adafruit Bluefruit core) only.
+#
+# Build:   arduino-cli compile --profile nrf52840
+# Upload:  arduino-cli upload  --profile nrf52840 -p /dev/ttyACM0
+#
+# First time on a machine, arduino-cli will fetch the pinned core/lib
+# listed below automatically (no manual Boards Manager steps).
+
+profiles:
+
+  # --- nRF52840 -------------------------------------------------------
+  # Default FQBN targets the Adafruit Feather nRF52840 Express. If your
+  # board differs, change `fqbn` only (e.g. Seeed XIAO nRF52840:
+  # Seeeduino:nrf52:xiaonRF52840Sense). Run `arduino-cli board listall
+  # nrf52` to see installed options.
+  nrf52840:
+    notes: Adafruit Feather nRF52840 Express — Bluefruit + NeoPixel puck.
+    fqbn: adafruit:nrf52:feather52840
+    platforms:
+      - platform: adafruit:nrf52 (1.6.1)
+        platform_index_url: https://adafruit.github.io/arduino-board-index/package_adafruit_index.json
+    libraries:
+      # BLE comes from Bluefruit, bundled with the adafruit:nrf52 core.
+      - Adafruit NeoPixel (1.12.3)
+
+# Profile used when --profile is omitted.
+default_profile: nrf52840

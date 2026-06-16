@@ -6,13 +6,556 @@
 /// few leave that way.
 /// Beware of spaghetti
 /// code journeyman.
+///
+/// nRF52840 (Adafruit Bluefruit core) firmware for the Modem Puck.
+/// Ported from modem_hw/modem_prototype, keeping its behavior but
+/// trading the Arduino-isms for an event-driven design:
+///   - ArduinoBLE polling -> Bluefruit write callback (no BLE.poll()).
+/// Audio is being reworked for a speaker (not the prototype's buzzer);
+/// playSound() is a stub pending that hardware.
+
+#include <bluefruit.h>
+#include <Adafruit_NeoPixel.h>
+#include "modem_types.h"
+
+/// Pins
+/// - - - - - - - - - - - -
+/// Set this to the GPIO actually wired on the nRF52840 carrier.
+constexpr uint8_t LIGHTS_PIN = 31;
+
+/// Lights
+/// - - - - - - - - - - - -
+Adafruit_NeoPixel strip(NUM_LIGHTS, LIGHTS_PIN, NEO_GRB + NEO_KHZ800);
+
+static const char* DEVICE_NAME = "Modem Puck";
+
+/// BLE service + characteristics
+/// - - - - - - - - - - - -
+/// 128-bit UUIDs in LSB-first byte order (Bluefruit convention).
+/// MSB string: fb59xxxx-ec62-4ba6-baf9-c02429a2a3ac
+/// Only byte [12] (the "xxxx" selector) changes per characteristic.
+static uint8_t const UUID_SVC[16]    = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x00,0x00,0x59,0xfb};
+static uint8_t const UUID_OWNER[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x01,0x00,0x59,0xfb};
+static uint8_t const UUID_NAME[16]   = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x02,0x00,0x59,0xfb};
+static uint8_t const UUID_SOUND[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x03,0x00,0x59,0xfb};
+static uint8_t const UUID_UNAME[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x04,0x00,0x59,0xfb};
+static uint8_t const UUID_COLOR[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x05,0x00,0x59,0xfb};
+static uint8_t const UUID_COUNT[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x06,0x00,0x59,0xfb};
+static uint8_t const UUID_STIME[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x07,0x00,0x59,0xfb};
+static uint8_t const UUID_SESS[16]   = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x08,0x00,0x59,0xfb};
+static uint8_t const UUID_ROSTER[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x09,0x00,0x59,0xfb};
+
+BLEService        modemSvc(UUID_SVC);
+BLECharacteristic ownerChar(UUID_OWNER);
+BLECharacteristic nameChar(UUID_NAME);
+BLECharacteristic soundChar(UUID_SOUND);
+BLECharacteristic colorChar(UUID_COLOR);
+// userName: each phone writes its own chosen display name here right after
+// connecting; the firmware stores it on that user so it can appear in the
+// roster broadcast (the BLE peer name is unreliable, especially on iOS).
+BLECharacteristic userNameChar(UUID_UNAME);
+// userCount: pushed to every connected phone whenever a phone joins/leaves so
+// the app can render the live "N / MAX_USERS" session roster size.
+BLECharacteristic countChar(UUID_COUNT);
+// screenTime: each phone writes its own accrued screen time (uint16 seconds,
+// little-endian) here every 10s; the firmware stores it on that user.
+BLECharacteristic stimeChar(UUID_STIME);
+// sessionTime: the puck owns the canonical session clock (seconds since the
+// first user joined) and pushes it to every phone once a minute so all devices
+// show the same session time. uint16 seconds, little-endian. READ + NOTIFY.
+BLECharacteristic sessChar(UUID_SESS);
+// roster: the full connected-user table (count + each user's color, screen
+// time and name), pushed to every phone whenever it changes so each phone can
+// render the complete "Total Screentime" leaderboard. READ + NOTIFY.
+BLECharacteristic rosterChar(UUID_ROSTER);
+
+// Cadence + bookkeeping for the once-a-minute session-time broadcast.
+constexpr uint32_t SESSION_NOTIFY_MS = 60000;  // push session time every minute
+static uint32_t    g_lastSessMS      = 0;       // last session-time push
+
+/// Light-strip FX
+/// - - - - - - - - - - - -
+/// The BLE callbacks only raise a flag + the color; loop() runs the whole
+/// sequence so strip.show() never runs in the SoftDevice callback context.
+/// Effects are colored by the triggering user (green fallback if unset),
+/// and never run until a color exists.
+///   color write -> spin color around board -> hold lit ~1s -> gauge -> off
+///   disconnect  -> color fades in fast -> flickers out -> gauge -> off
+enum class FxPhase : uint8_t { Idle, Spin, Hold, FadeIn, Flicker, Gauge };
+static volatile bool     g_connectFx    = false;
+static volatile bool     g_disconnectFx = false;
+static volatile uint32_t g_fxColor      = 0;    // color for the running FX
+static FxPhase           g_fxPhase      = FxPhase::Idle;
+static uint32_t          g_fxNextMS     = 0;     // next phase/frame time
+static uint32_t          g_fxStartMS    = 0;     // start of a time-based phase
+static uint16_t          g_fxStep       = 0;     // step within a phase
+constexpr uint32_t SPIN_STEP_MS  = 45;    // per-LED spin speed
+constexpr uint32_t HOLD_MS       = 1000;  // board lit after the spin
+constexpr uint32_t FADEIN_MS     = 150;   // fast fade-in on disconnect
+constexpr uint32_t FX_FRAME_MS   = 20;    // fade-in frame interval
+constexpr uint8_t  FLICKER_STEPS = 6;     // on/off toggles when flickering out
+constexpr uint32_t FLICKER_MS    = 55;    // per flicker toggle
+constexpr uint32_t GAUGE_MS      = 600;   // user-count display duration
+
+/// State + Session
+/// - - - - - - - - - - - -
+/// CURR_STATE is the device power mode. g_session holds the live set of
+/// connected users; it exists (Active) whenever userCount > 0 and is torn
+/// down (Idle) once the last user leaves.
+State   CURR_STATE = State::Idle;
+Session g_session;
+
+
+/// Helpers
+/// - - - - - - - - - - - -
+static uint32_t parseRGB(const char* s) {
+  int r = 0, g = 0, b = 0;
+  sscanf(s, "%d,%d,%d", &r, &g, &b);
+  r = constrain(r, 0, 255);
+  g = constrain(g, 0, 255);
+  b = constrain(b, 0, 255);
+  Serial.print("color rx: \""); Serial.print(s);
+  Serial.print("\" -> "); Serial.print(r); Serial.print(',');
+  Serial.print(g); Serial.print(','); Serial.println(b);
+  return strip.Color((uint8_t)r, (uint8_t)g, (uint8_t)b);
+}
+
+// Fill the whole strip with one color.
+static void showColor(uint32_t c) {
+  for (uint16_t i = 0; i < NUM_LIGHTS; i++) strip.setPixelColor(i, c);
+  strip.show();
+}
+
+// Light a fraction of the strip proportional to connected users
+// (userCount / MAX_USERS), rounded to the nearest LED.
+static void showUserGauge() {
+  uint16_t lit = (uint16_t)(((uint32_t)g_session.userCount * NUM_LIGHTS
+                             + MAX_USERS / 2) / MAX_USERS);
+  strip.clear();
+  for (uint16_t i = 0; i < lit; i++)
+    strip.setPixelColor(i, strip.Color(255, 255, 255));   // white gauge
+  strip.show();
+}
+
+// Fill the strip with a color dimmed to scale/255 (used for the fades).
+static void showColorScaled(uint32_t c, uint8_t scale) {
+  uint8_t r = (uint8_t)((((c >> 16) & 0xFF) * scale) / 255);
+  uint8_t g = (uint8_t)((((c >>  8) & 0xFF) * scale) / 255);
+  uint8_t b = (uint8_t)((((c      ) & 0xFF) * scale) / 255);
+  showColor(strip.Color(r, g, b));
+}
+
+// Effects need a visible color; fall back to green when a user has none.
+static uint32_t colorOrFallback(uint32_t c) {
+  return c ? c : strip.Color(0, 150, 0);   // green
+}
+
+// Spin frame: light LEDs 0..head so the lit arc grows as the head travels
+// around, leaving the whole board lit by the end of the lap.
+static void showSpin(uint32_t c, uint16_t head) {
+  strip.clear();
+  for (uint16_t i = 0; i <= head && i < NUM_LIGHTS; i++)
+    strip.setPixelColor(i, c);
+  strip.show();
+}
+
+// TODO: speaker audio playback (to be implemented).
+// Hardware will drive a speaker rather than the prototype's buzzer; the
+// audio path (I2S / PWM / DAC + pin assignment) is still pending.
+static void playSound() {
+  // intentionally empty - to be implemented
+}
+
+/// Session / Users
+/// - - - - - - - - - - - -
+/// Users are stored by value inside g_session and looked up by their BLE
+/// connHandle. The session is created on the first connect and destroyed
+/// when the last user disconnects, carrying the device State with it.
+
+// Push the current user count to every connected phone. The characteristic
+// value is also kept current so a late reader (or a fresh connect) sees the
+// right number without waiting for the next join/leave.
+static void notifyUserCount() {
+  const uint8_t n = g_session.userCount;
+  countChar.write8(n);
+  for (uint8_t i = 0; i < g_session.userCount; i++)
+    countChar.notify(g_session.connectedUsers[i].connHandle, &n, 1);
+}
+
+// Push the canonical session time (seconds since the first user joined) to
+// every connected phone so all devices share one synced clock. Zero while Idle.
+static void notifySessionTime() {
+  uint16_t secs = 0;
+  if (CURR_STATE == State::Active && g_session.startTimeMS) {
+    uint32_t elapsed = (millis() - g_session.startTimeMS) / 1000;
+    secs = elapsed > 0xFFFF ? 0xFFFF : (uint16_t)elapsed;
+  }
+  sessChar.write16(secs);
+  for (uint8_t i = 0; i < g_session.userCount; i++)
+    sessChar.notify16(g_session.connectedUsers[i].connHandle, secs);
+}
+
+// Serialize the connected-user table and push it to every phone so each can
+// render the full leaderboard. Layout (little-endian):
+//   [0]    userCount
+//   per user: R, G, B, screenTime(uint16), nameLen, name[nameLen]
+// The characteristic value is kept current so a fresh reader sees the roster
+// without waiting for the next change.
+static void notifyRoster() {
+  uint8_t buf[1 + MAX_USERS * (3 + 2 + 1 + MAX_USER_NAME_LEN)];
+  uint16_t n = 0;
+  buf[n++] = g_session.userCount;
+  for (uint8_t i = 0; i < g_session.userCount; i++) {
+    const User& u = g_session.connectedUsers[i];
+    buf[n++] = (uint8_t)((u.color >> 16) & 0xFF);   // R
+    buf[n++] = (uint8_t)((u.color >>  8) & 0xFF);   // G
+    buf[n++] = (uint8_t)( u.color        & 0xFF);   // B
+    buf[n++] = (uint8_t)( u.screenTime        & 0xFF);
+    buf[n++] = (uint8_t)((u.screenTime >>  8) & 0xFF);
+    uint8_t len = (uint8_t)strnlen(u.name, MAX_USER_NAME_LEN);
+    buf[n++] = len;
+    memcpy(&buf[n], u.name, len);
+    n += len;
+  }
+  rosterChar.write(buf, n);
+  for (uint8_t i = 0; i < g_session.userCount; i++)
+    rosterChar.notify(g_session.connectedUsers[i].connHandle, buf, n);
+}
+
+// Find the User that owns a connection (nullptr if none).
+static User* findUser(uint16_t conn_handle) {
+  for (uint8_t i = 0; i < g_session.userCount; i++)
+    if (g_session.connectedUsers[i].connHandle == conn_handle)
+      return &g_session.connectedUsers[i];
+  return nullptr;
+}
+
+// First user in -> spin up a session and go Active.
+static void startSession() {
+  g_session.ID++;
+  g_session.startTimeMS = millis();
+  CURR_STATE = State::Active;
+  Serial.print("session "); Serial.print(g_session.ID);
+  Serial.println(" started -> Active");
+}
+
+// Last user out -> tear the session down and go Idle.
+static void endSession() {
+  g_session.startTimeMS = 0;
+  CURR_STATE = State::Idle;
+  Serial.println("session ended -> Idle");
+}
+
+// Register a freshly-connected central as a User, creating the session if
+// it is the first one. Returns nullptr if we are already full.
+static User* addUser(uint16_t conn_handle) {
+  if (g_session.userCount >= MAX_USERS) return nullptr;
+  bool firstUser = (g_session.userCount == 0);
+
+  User& u = g_session.connectedUsers[g_session.userCount];
+  u = User{};                    // zero-init (screenTime left for later)
+  u.ID         = g_session.userCount;
+  u.connHandle = conn_handle;
+  BLEConnection* c = Bluefruit.Connection(conn_handle);
+  if (c) c->getPeerName(u.name, sizeof(u.name));   // phone's name, if any
+  g_session.userCount++;
+
+  if (firstUser) startSession();
+  return &u;
+}
+
+// Drop a disconnected central, keeping the array packed. Ends the session
+// when the last user leaves.
+static void removeUser(uint16_t conn_handle) {
+  for (uint8_t i = 0; i < g_session.userCount; i++) {
+    if (g_session.connectedUsers[i].connHandle == conn_handle) {
+      for (uint8_t j = i; j + 1 < g_session.userCount; j++)
+        g_session.connectedUsers[j] = g_session.connectedUsers[j + 1];
+      g_session.userCount--;
+      break;
+    }
+  }
+  if (g_session.userCount == 0) endSession();
+}
+
+// Called whenever a central connects to the puck.
+static void connectCallback(uint16_t conn_handle) {
+  addUser(conn_handle);
+  // No FX here: effects wait until the user sends a color (see onColorWrite).
+
+  // Write the device name back to the phone: push it as a notification
+  // (the characteristic value is also readable as a fallback).
+  nameChar.notify(conn_handle, DEVICE_NAME, strlen(DEVICE_NAME));
+
+  // Tell every phone (including this one) the new roster size, the freshly
+  // joined user table, and the current session clock (so a late joiner sees
+  // the synced time immediately rather than waiting up to a minute).
+  notifyUserCount();
+  notifyRoster();
+  notifySessionTime();
+  g_lastSessMS = millis();
+
+  Serial.print("connect: users="); Serial.println(g_session.userCount);
+
+  // Keep advertising while connection slots remain.
+  if (g_session.userCount < MAX_USERS)
+    Bluefruit.Advertising.start(0);
+}
+
+// Called whenever a central disconnects.
+static void disconnectCallback(uint16_t conn_handle, uint8_t /*reason*/) {
+  // Capture the leaving user's color before their slot is reclaimed so
+  // loop() can flicker it out and then refresh the user gauge.
+  User* u = findUser(conn_handle);
+  g_fxColor      = colorOrFallback(u ? u->color : 0);
+  g_disconnectFx = true;
+
+  removeUser(conn_handle);
+
+  // Tell the phones that remain the new roster size and user table.
+  notifyUserCount();
+  notifyRoster();
+
+  Serial.print("disconnect: users="); Serial.println(g_session.userCount);
+  // restartOnDisconnect(true) re-advertises automatically.
+}
+
+// Bluefruit write-callback for the screen-time characteristic. Each phone
+// reports its own accrued screen time as a little-endian uint16 (seconds); we
+// store it against the user that owns the writing connection.
+static void onScreenTimeWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
+                              uint8_t* data, uint16_t len) {
+  if (len < 2) return;
+  uint16_t secs = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+  User* u = findUser(conn_handle);
+  if (u) u->screenTime = secs;
+  Serial.print("screenTime rx conn="); Serial.print(conn_handle);
+  Serial.print(" -> "); Serial.println(secs);
+  // Screen time feeds the leaderboard — refresh every phone's roster.
+  notifyRoster();
+}
+
+// Bluefruit write-callback for the per-user name characteristic. Each phone
+// uploads its chosen display name right after connecting; we store it on the
+// user that owns the writing connection so it can appear in the roster.
+static void onUserNameWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
+                            uint8_t* data, uint16_t len) {
+  User* u = findUser(conn_handle);
+  if (!u) return;
+  uint16_t n = len < MAX_USER_NAME_LEN - 1 ? len : MAX_USER_NAME_LEN - 1;
+  memcpy(u->name, data, n);
+  u->name[n] = '\0';
+  Serial.print("userName rx conn="); Serial.print(conn_handle);
+  Serial.print(" -> "); Serial.println(u->name);
+  notifyRoster();
+}
+
+// Bluefruit write-callback signature.
+static void onColorWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
+                         uint8_t* data, uint16_t len) {
+  char buf[33];
+  uint16_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+  memcpy(buf, data, n);
+  buf[n] = '\0';
+
+  uint32_t color = parseRGB(buf);
+
+  // Remember the choice against the user who sent it.
+  User* u = findUser(conn_handle);
+  if (u) u->color = color;
+
+  // Color shows in each leaderboard row — refresh every phone's roster.
+  notifyRoster();
+
+  // A color write drives the connect FX (spin -> hold -> gauge -> off),
+  // colored by this user (green fallback if somehow unset).
+  g_fxColor   = colorOrFallback(color);
+  g_connectFx = true;
+}
 
 void setup() {
-  // put your setup code here, to run once:
+  Serial.begin(115200);
 
+  // Lights: init first, then sit at the idle (cleared) color.
+  strip.begin();
+  strip.setBrightness(100);
+  strip.clear();
+  strip.show();
+
+  // BLE: Bluefruit peripheral + GATT server.
+  // Allow up to MAX_USERS concurrent peripheral connections.
+  Bluefruit.begin(MAX_USERS);
+  Bluefruit.setTxPower(4);
+  Bluefruit.setName(DEVICE_NAME);
+  Bluefruit.Periph.setConnectCallback(connectCallback);
+  Bluefruit.Periph.setDisconnectCallback(disconnectCallback);
+  // Parent service must begin() before the characteristics it owns.
+  modemSvc.begin();
+
+  ownerChar.setProperties(CHR_PROPS_READ);
+  ownerChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  ownerChar.setMaxLen(MAX_USER_NAME_LEN);
+  ownerChar.begin();
+  ownerChar.write("Owner");
+
+  // READ + NOTIFY so the puck can push its name back to connected phones.
+  nameChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  nameChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  nameChar.setMaxLen(MAX_DEVICE_NAME_LEN);
+  nameChar.begin();
+  nameChar.write(DEVICE_NAME);
+
+  // Sound write target retained for parity with the prototype's GATT table.
+  soundChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  soundChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  soundChar.setMaxLen(1);
+  soundChar.begin();
+
+  colorChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  colorChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  colorChar.setMaxLen(32);
+  colorChar.setWriteCallback(onColorWrite);
+  colorChar.begin();
+
+  // READ + NOTIFY: live count of connected phones (0..MAX_USERS). The app
+  // reads it once and subscribes for join/leave updates.
+  countChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  countChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  countChar.setMaxLen(1);
+  countChar.begin();
+  countChar.write8(g_session.userCount);
+
+  // WRITE: per-phone chosen display name (UTF-8). Stored on the writing user
+  // and echoed back to everyone in the roster broadcast.
+  userNameChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  userNameChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  userNameChar.setMaxLen(MAX_USER_NAME_LEN);
+  userNameChar.setWriteCallback(onUserNameWrite);
+  userNameChar.begin();
+
+  // WRITE: per-phone screen-time telemetry (uint16 seconds, little-endian).
+  stimeChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  stimeChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  stimeChar.setMaxLen(2);
+  stimeChar.setWriteCallback(onScreenTimeWrite);
+  stimeChar.begin();
+
+  // READ + NOTIFY: canonical session clock (uint16 seconds). Pushed once a
+  // minute (and on every join) so all phones share one synced session time.
+  sessChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  sessChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  sessChar.setMaxLen(2);
+  sessChar.begin();
+  sessChar.write16(0);
+
+  // READ + NOTIFY: full connected-user roster (see notifyRoster for layout).
+  // Pushed whenever the table changes so every phone shows the same leaderboard.
+  rosterChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  rosterChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  rosterChar.setMaxLen(1 + MAX_USERS * (3 + 2 + 1 + MAX_USER_NAME_LEN));
+  rosterChar.begin();
+  { const uint8_t empty = 0; rosterChar.write(&empty, 1); }
+
+  // Advertise the service; the stack re-advertises itself after a drop.
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addService(modemSvc);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setInterval(32, 244);  // 20 ms .. 152.5 ms
+  Bluefruit.Advertising.setFastTimeout(30);
+  Bluefruit.Advertising.start(0);              // 0 = advertise forever
+
+  // Start Idle with an empty session; the first connection creates one.
+  g_session  = Session{};
+  CURR_STATE = State::Idle;
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
+  const uint32_t now = millis();
 
+  // The puck owns the session clock: push it to every phone once a minute so
+  // all devices stay in sync. (A baseline is also pushed on each join.)
+  if (CURR_STATE == State::Active &&
+      (int32_t)(now - g_lastSessMS) >= (int32_t)SESSION_NOTIFY_MS) {
+    g_lastSessMS = now;
+    notifySessionTime();
+  }
+
+  // A color write starts the connect FX: spin -> hold lit -> gauge -> off.
+  if (g_connectFx) {
+    g_connectFx = false;
+    g_fxPhase  = FxPhase::Spin;
+    g_fxStep   = 0;
+    g_fxNextMS = now;                        // first spin frame now
+    playSound();
+  }
+
+  // A disconnect starts the leave FX: fade in fast -> flicker out -> gauge.
+  if (g_disconnectFx) {
+    g_disconnectFx = false;
+    g_fxPhase   = FxPhase::FadeIn;
+    g_fxStartMS = now;
+    g_fxStep    = 0;
+    g_fxNextMS  = now;
+  }
+
+  // Advance whichever FX is running once its frame/phase timer elapses.
+  if (g_fxPhase != FxPhase::Idle && (int32_t)(now - g_fxNextMS) >= 0) {
+    switch (g_fxPhase) {
+      case FxPhase::Spin:
+        showSpin(g_fxColor, g_fxStep);
+        if (g_fxStep + 1 >= NUM_LIGHTS) {    // full lap -> hold the board lit
+          g_fxPhase  = FxPhase::Hold;
+          g_fxNextMS = now + HOLD_MS;
+        } else {
+          g_fxStep++;
+          g_fxNextMS = now + SPIN_STEP_MS;
+        }
+        break;
+
+      case FxPhase::Hold:                    // held lit -> show capacity
+        showUserGauge();
+        g_fxPhase  = FxPhase::Gauge;
+        g_fxNextMS = now + GAUGE_MS;
+        break;
+
+      case FxPhase::FadeIn: {
+        uint32_t elapsed = now - g_fxStartMS;
+        if (elapsed >= FADEIN_MS) {          // fully in -> start flickering
+          showColor(g_fxColor);
+          g_fxPhase  = FxPhase::Flicker;
+          g_fxStep   = 0;
+          g_fxNextMS = now + FLICKER_MS;
+        } else {
+          uint8_t scale = (uint8_t)(255UL * elapsed / FADEIN_MS);
+          showColorScaled(g_fxColor, scale);
+          g_fxNextMS = now + FX_FRAME_MS;
+        }
+        break;
+      }
+
+      case FxPhase::Flicker:
+        if (g_fxStep >= FLICKER_STEPS) {     // ended off -> show capacity
+          showUserGauge();
+          g_fxPhase  = FxPhase::Gauge;
+          g_fxNextMS = now + GAUGE_MS;
+        } else {
+          if (g_fxStep & 1) { strip.clear(); strip.show(); }  // off
+          else              showColor(g_fxColor);             // on
+          g_fxStep++;
+          g_fxNextMS = now + FLICKER_MS;
+        }
+        break;
+
+      case FxPhase::Gauge:                   // capacity held -> all off
+        strip.clear();
+        strip.show();
+        g_fxPhase = FxPhase::Idle;
+        break;
+
+      case FxPhase::Idle:
+        break;
+    }
+  }
 }

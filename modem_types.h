@@ -19,8 +19,8 @@
 // Device Properties
 constexpr uint8_t MAX_DEVICE_NAME_LEN = 32;
 constexpr uint8_t MAX_USERS = 8;
-constexpr uint8_t MAX_LED_COUNT = 12;
 constexpr uint8_t MAX_KEYFRAMES = 32;
+constexpr uint8_t NUM_LIGHTS = 12;
 // User Properties
 constexpr uint8_t MAX_USER_NAME_LEN = 24;
 
@@ -33,7 +33,7 @@ constexpr uint8_t MAX_USER_NAME_LEN = 24;
 /// mode of the device.
 /// Idle = Low Power / Sleep
 /// Active = High Power / Normal
-enum class State : uint8_t { Idle, Active };
+enum class State { Idle, Active };
 
 /// User
 /// - - - - - - - - - - - -
@@ -52,7 +52,7 @@ struct User {
   uint8_t ID;
   uint16_t connHandle;
   char name[MAX_USER_NAME_LEN];
-  uint8_t colorID;
+  uint32_t color;
   uint8_t animationID;
   uint8_t soundID;
   uint16_t screenTime;
@@ -83,7 +83,7 @@ struct Session {
 /// of the device
 struct Frame {
   uint8_t brightness;
-  uint8_t values[MAX_LED_COUNT];
+  uint8_t values[NUM_LIGHTS];
 };
 
 /// Animation
