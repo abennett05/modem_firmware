@@ -17,6 +17,7 @@
 #include <bluefruit.h>
 #include <Adafruit_NeoPixel.h>
 #include "modem_types.h"
+#include "ancs_client.h"
 
 /// Pins
 /// - - - - - - - - - - - -
@@ -44,6 +45,16 @@ static uint8_t const UUID_COUNT[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,
 static uint8_t const UUID_STIME[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x07,0x00,0x59,0xfb};
 static uint8_t const UUID_SESS[16]   = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x08,0x00,0x59,0xfb};
 static uint8_t const UUID_ROSTER[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x09,0x00,0x59,0xfb};
+// allowlist: per-connection NOTIFICATION allowlist (Phase B). Selector 0x0A —
+// NOT 0x05: 0x05 is already the color characteristic. The phone writes ITS
+// bundle-ID list here; the puck resolves the writing connHandle to its ANCS
+// slot and feeds that slot's allowlist. See onAllowlistWrite.
+static uint8_t const UUID_ALLOW[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0a,0x00,0x59,0xfb};
+// disconnect: the phone writes here (any byte) to ask the puck to sever ITS side
+// of the link. Selector 0x0B. iOS keeps a bonded ANCS connection alive when only
+// the phone calls cancelPeripheralConnection, so the puck (the peripheral) must
+// initiate the GAP disconnect for the link to actually drop. See onDisconnectRequest.
+static uint8_t const UUID_DISCONN[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0b,0x00,0x59,0xfb};
 
 BLEService        modemSvc(UUID_SVC);
 BLECharacteristic ownerChar(UUID_OWNER);
@@ -68,6 +79,15 @@ BLECharacteristic sessChar(UUID_SESS);
 // time and name), pushed to every phone whenever it changes so each phone can
 // render the complete "Total Screentime" leaderboard. READ + NOTIFY.
 BLECharacteristic rosterChar(UUID_ROSTER);
+// allowlist: the connected phone writes its per-user notification allowlist here
+// (null-/newline-separated UTF-8 bundle IDs, capped at ALLOW_PAYLOAD_MAX bytes).
+// WRITE / WRITE_WO_RESP. The write is associated with the writing connHandle ->
+// resolved to that phone's ANCS slot -> fed to ancsSetAllowlist. Per-slot only.
+BLECharacteristic allowChar(UUID_ALLOW);
+constexpr uint16_t ALLOW_PAYLOAD_MAX = 256;
+// disconnect: the connected phone writes here to request that the puck drop its
+// link (peripheral-initiated GAP disconnect — see UUID_DISCONN). WRITE / WRITE_WO_RESP.
+BLECharacteristic disconnChar(UUID_DISCONN);
 
 // Cadence + bookkeeping for the once-a-minute session-time broadcast.
 constexpr uint32_t SESSION_NOTIFY_MS = 60000;  // push session time every minute
@@ -79,11 +99,17 @@ static uint32_t    g_lastSessMS      = 0;       // last session-time push
 /// sequence so strip.show() never runs in the SoftDevice callback context.
 /// Effects are colored by the triggering user (green fallback if unset),
 /// and never run until a color exists.
-///   color write -> spin color around board -> hold lit ~1s -> gauge -> off
-///   disconnect  -> color fades in fast -> flickers out -> gauge -> off
-enum class FxPhase : uint8_t { Idle, Spin, Hold, FadeIn, Flicker, Gauge };
+///   color write   -> spin color around board -> hold lit ~1s -> gauge -> off
+///   disconnect    -> color fades in fast -> flickers out -> gauge -> off
+///   notification  -> pulse the user's color a few times -> off
+enum class FxPhase : uint8_t { Idle, Spin, Hold, FadeIn, Flicker, Gauge, Pulse };
 static volatile bool     g_connectFx    = false;
 static volatile bool     g_disconnectFx = false;
+// Notification FX is requested from the BLE event task (triggerNotifyLight) with
+// its own color so a match never clobbers a connect/disconnect FX mid-run; loop()
+// latches it into the shared g_fxColor when it actually starts the pulse.
+static volatile bool     g_notifyFx     = false;
+static volatile uint32_t g_notifyColor  = 0;    // color for a pending notify pulse
 static volatile uint32_t g_fxColor      = 0;    // color for the running FX
 static FxPhase           g_fxPhase      = FxPhase::Idle;
 static uint32_t          g_fxNextMS     = 0;     // next phase/frame time
@@ -95,6 +121,8 @@ constexpr uint32_t FADEIN_MS     = 150;   // fast fade-in on disconnect
 constexpr uint32_t FX_FRAME_MS   = 20;    // fade-in frame interval
 constexpr uint8_t  FLICKER_STEPS = 6;     // on/off toggles when flickering out
 constexpr uint32_t FLICKER_MS    = 55;    // per flicker toggle
+constexpr uint8_t  NOTIFY_PULSES  = 3;    // ramp up+down cycles on a notification
+constexpr uint32_t NOTIFY_HALF_MS = 220;  // duration of one ramp (up OR down)
 constexpr uint32_t GAUGE_MS      = 600;   // user-count display duration
 
 /// State + Session
@@ -104,6 +132,19 @@ constexpr uint32_t GAUGE_MS      = 600;   // user-count display duration
 /// down (Idle) once the last user leaves.
 State   CURR_STATE = State::Idle;
 Session g_session;
+
+/// Phone-requested disconnect queue
+/// - - - - - - - - - - - -
+/// A phone asks the puck to sever its link by writing the disconnect
+/// characteristic (UUID_DISCONN). The write callback only ENQUEUES the conn
+/// handle here; loop() drains the queue and issues the GAP disconnect, so we
+/// never call into the SoftDevice from deep inside a GATT write callback. SPSC
+/// ring (producer: write callback / BLE task; consumer: loop()); sized one past
+/// MAX_USERS so a full session can request teardown without overrun.
+constexpr uint8_t DISC_Q_SIZE = MAX_USERS + 1;
+static volatile uint16_t g_discQueue[DISC_Q_SIZE];
+static volatile uint8_t  g_discHead = 0;   // consumer (loop)
+static volatile uint8_t  g_discTail = 0;   // producer (callback)
 
 
 /// Helpers
@@ -168,6 +209,30 @@ static void showSpin(uint32_t c, uint16_t head) {
 // audio path (I2S / PWM / DAC + pin assignment) is still pending.
 static void playSound() {
   // intentionally empty - to be implemented
+}
+
+/// ANCS notify-light trigger
+/// - - - - - - - - - - - -
+/// Called by ancs_client when an Added notification's app bundle ID matches the
+/// allowlist for `slotIndex` (an ANCS slot). Pulses the strip in THAT user's
+/// color. Only joined session members animate: a notification on a connection
+/// that never joined (e.g. a system ANCS reconnect that re-subscribed on its own)
+/// is logged and ignored, so it can't flash the green fallback.
+void triggerNotifyLight(uint8_t slotIndex) {
+  uint16_t conn = ancsConnHandle(slotIndex);   // ANCS slot -> conn handle
+  User*    u    = findUser(conn);              // conn handle -> user (color)
+  Serial.print("MODEM_ANCS triggerNotifyLight slot="); Serial.print(slotIndex);
+  Serial.print(" conn=0x"); Serial.print(conn, HEX);
+  Serial.print(" color=0x"); Serial.println(u ? u->color : 0, HEX);
+  if (!u) {   // not a session member -> no light
+    Serial.println("MODEM_ANCS notify on non-member conn, ignoring light");
+    return;
+  }
+  // Runs in the BLE event task: only raise a flag + remember the color (green
+  // fallback if the member somehow has no color). loop() runs the pulse so
+  // strip.show() never executes in callback context (this file's cardinal rule).
+  g_notifyColor = colorOrFallback(u->color);
+  g_notifyFx    = true;
 }
 
 /// Session / Users
@@ -268,6 +333,36 @@ static User* addUser(uint16_t conn_handle) {
   return &u;
 }
 
+// Promote a BLE connection to a session member on its first identity write
+// (color or userName). A bare BLE connection is NOT a join: iOS keeps/reopens a
+// bonded ANCS link on its own (the "phantom reconnect"), and that link has no app
+// behind it, so it never writes an identity and never joins here. Idempotent —
+// returns the existing user if this conn already joined. Pushes the join-time
+// broadcasts (count / roster / synced clock) exactly once, when the user is added.
+static User* joinUser(uint16_t conn_handle) {
+  User* u = findUser(conn_handle);
+  if (u) return u;                 // already a member (later identity writes)
+
+  u = addUser(conn_handle);
+  if (!u) return nullptr;          // session full
+
+  // Now that this connection is a real session member, subscribe its ANCS feed.
+  // ANCS subscription is gated on the join so a phantom reconnect (iOS reopening
+  // the bonded link with no app behind it) never subscribes and never steals
+  // notification delivery from the real, joined connection.
+  ancsOnJoin(conn_handle);
+
+  // Tell every phone the new roster size, the freshly joined table, and the
+  // current session clock (so this joiner sees the synced time immediately).
+  notifyUserCount();
+  notifyRoster();
+  notifySessionTime();
+  g_lastSessMS = millis();
+
+  Serial.print("join: users="); Serial.println(g_session.userCount);
+  return u;
+}
+
 // Drop a disconnected central, keeping the array packed. Ends the session
 // when the last user leaves.
 static void removeUser(uint16_t conn_handle) {
@@ -282,36 +377,48 @@ static void removeUser(uint16_t conn_handle) {
   if (g_session.userCount == 0) endSession();
 }
 
-// Called whenever a central connects to the puck.
+// Called whenever a central connects to the puck. A connection is NOT yet a
+// session join: we start ANCS (so notifications work) but defer addUser/roster/FX
+// until the phone sends its identity (see joinUser / onColorWrite). This is what
+// makes a system ANCS reconnect — which has no app behind it and never writes an
+// identity — invisible to the session instead of a "phantom user".
 static void connectCallback(uint16_t conn_handle) {
-  addUser(conn_handle);
-  // No FX here: effects wait until the user sends a color (see onColorWrite).
+  // Start this slot's per-connection ANCS client (requests bonding; discovery +
+  // subscribe happen once the link is secured). ancs_client keys by conn_handle
+  // and owns its own slot; userHint is log-only and unknown until a join, so 0xFF.
+  ancsOnConnect(conn_handle, 0xFF);
 
   // Write the device name back to the phone: push it as a notification
   // (the characteristic value is also readable as a fallback).
   nameChar.notify(conn_handle, DEVICE_NAME, strlen(DEVICE_NAME));
 
-  // Tell every phone (including this one) the new roster size, the freshly
-  // joined user table, and the current session clock (so a late joiner sees
-  // the synced time immediately rather than waiting up to a minute).
-  notifyUserCount();
-  notifyRoster();
-  notifySessionTime();
-  g_lastSessMS = millis();
+  Serial.print("BLE connect: links="); Serial.println(Bluefruit.connected());
 
-  Serial.print("connect: users="); Serial.println(g_session.userCount);
-
-  // Keep advertising while connection slots remain.
-  if (g_session.userCount < MAX_USERS)
+  // Keep advertising while physical connection slots remain.
+  if (Bluefruit.connected() < MAX_USERS)
     Bluefruit.Advertising.start(0);
 }
 
 // Called whenever a central disconnects.
 static void disconnectCallback(uint16_t conn_handle, uint8_t /*reason*/) {
-  // Capture the leaving user's color before their slot is reclaimed so
-  // loop() can flicker it out and then refresh the user gauge.
+  // Tear down this slot's ANCS client first (halt fetches, drop allowlist,
+  // reset buffers). Always runs — even for a connection that never joined the
+  // session (e.g. a phantom ANCS reconnect). Idempotent + matches the exact
+  // conn_handle; safe before the user slot is reclaimed.
+  ancsOnDisconnect(conn_handle);
+
+  // Only a connection that actually JOINED the session affects the roster/FX. A
+  // non-member drop (phantom reconnect, or a link that never sent its identity)
+  // changes nothing visible — no leave FX, no count/roster churn.
   User* u = findUser(conn_handle);
-  g_fxColor      = colorOrFallback(u ? u->color : 0);
+  if (!u) {
+    Serial.print("BLE disconnect (non-member): links="); Serial.println(Bluefruit.connected());
+    return;
+  }
+
+  // Capture the leaving member's color before their slot is reclaimed so loop()
+  // can flicker it out and then refresh the user gauge.
+  g_fxColor      = colorOrFallback(u->color);
   g_disconnectFx = true;
 
   removeUser(conn_handle);
@@ -344,8 +451,9 @@ static void onScreenTimeWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
 // user that owns the writing connection so it can appear in the roster.
 static void onUserNameWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
                             uint8_t* data, uint16_t len) {
-  User* u = findUser(conn_handle);
-  if (!u) return;
+  // First identity write joins this connection to the session (no-op if already).
+  User* u = joinUser(conn_handle);
+  if (!u) return;                  // session full
   uint16_t n = len < MAX_USER_NAME_LEN - 1 ? len : MAX_USER_NAME_LEN - 1;
   memcpy(u->name, data, n);
   u->name[n] = '\0';
@@ -364,9 +472,11 @@ static void onColorWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
 
   uint32_t color = parseRGB(buf);
 
-  // Remember the choice against the user who sent it.
-  User* u = findUser(conn_handle);
-  if (u) u->color = color;
+  // First identity write joins this connection to the session (no-op if already).
+  // A phantom ANCS reconnect never sends a color, so it never joins or animates.
+  User* u = joinUser(conn_handle);
+  if (!u) return;                  // session full — ignore the write
+  u->color = color;
 
   // Color shows in each leaderboard row — refresh every phone's roster.
   notifyRoster();
@@ -375,6 +485,36 @@ static void onColorWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   // colored by this user (green fallback if somehow unset).
   g_fxColor   = colorOrFallback(color);
   g_connectFx = true;
+}
+
+// Bluefruit write-callback for the per-connection notification allowlist.
+// The connected phone writes ITS bundle-ID list (null-/newline-separated UTF-8).
+// We resolve the WRITING connHandle to its ANCS slot (NOT to a fixed index —
+// handles are opaque/reused) and hand the raw payload to that slot's parser.
+// Allowlists are strictly per-slot; nothing is shared or merged across slots.
+static void onAllowlistWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
+                             uint8_t* data, uint16_t len) {
+  int slot = ancsSlotForHandle(conn_handle);   // connHandle -> ANCS slot
+  Serial.print("MODEM_ANCS allowlist write conn=0x"); Serial.print(conn_handle, HEX);
+  Serial.print(" len="); Serial.print(len);
+  Serial.print(" -> slot="); Serial.println(slot);
+  if (slot < 0) return;                          // no ANCS slot for this conn
+  if (len > ALLOW_PAYLOAD_MAX) len = ALLOW_PAYLOAD_MAX;   // bounded
+  ancsSetAllowlist((uint8_t)slot, data, len);
+}
+
+// Bluefruit write-callback for the disconnect characteristic. The connected
+// phone writes here (the payload is ignored — any write is a request) to ask the
+// puck to sever ITS side of the link. We only ENQUEUE the writing connHandle;
+// loop() issues Bluefruit.disconnect(), which then fires disconnectCallback for
+// the normal graceful teardown (ANCS slot reset, user removal, leave FX).
+static void onDisconnectRequest(uint16_t conn_handle, BLECharacteristic* /*chr*/,
+                                uint8_t* /*data*/, uint16_t /*len*/) {
+  Serial.print("disconnect request conn=0x"); Serial.println(conn_handle, HEX);
+  uint8_t nextTail = (uint8_t)((g_discTail + 1) % DISC_Q_SIZE);
+  if (nextTail == g_discHead) return;     // queue full — loop() will catch up
+  g_discQueue[g_discTail] = conn_handle;
+  g_discTail = nextTail;
 }
 
 void setup() {
@@ -460,6 +600,28 @@ void setup() {
   rosterChar.begin();
   { const uint8_t empty = 0; rosterChar.write(&empty, 1); }
 
+  // WRITE: per-connection notification allowlist (Phase B). The phone writes its
+  // bundle-ID list; onAllowlistWrite routes it to the writer's ANCS slot.
+  allowChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  allowChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  allowChar.setMaxLen(ALLOW_PAYLOAD_MAX);
+  allowChar.setWriteCallback(onAllowlistWrite);
+  allowChar.begin();
+
+  // WRITE: phone-requested disconnect. The app writes here (any value) to ask
+  // the puck to drop ITS link; onDisconnectRequest enqueues the writer's conn
+  // handle and loop() initiates the GAP disconnect so iOS actually severs the
+  // bonded ANCS connection (a phone-side cancel alone leaves the link up).
+  disconnChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  disconnChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  disconnChar.setMaxLen(1);
+  disconnChar.setWriteCallback(onDisconnectRequest);
+  disconnChar.begin();
+
+  // Per-slot ANCS consumer: registers the per-connection ANCS client services
+  // and the secured-link callback. Must come after Bluefruit.begin().
+  ancsBegin();
+
   // Advertise the service; the stack re-advertises itself after a drop.
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
@@ -477,6 +639,30 @@ void setup() {
 
 void loop() {
   const uint32_t now = millis();
+
+  // Pump the per-slot ANCS clients: issue any pending Control Point attribute
+  // fetches (non-blocking). Callbacks only parse/enqueue; the work happens here.
+  ancsService();
+
+  // Honor any phone-requested disconnects: the peripheral must initiate the GAP
+  // disconnect so iOS actually drops the link (a phone-side cancel alone leaves
+  // it up). disconnectCallback then runs the normal teardown (ANCS slot reset +,
+  // if the conn was a joined session member, user removal + leave FX).
+  //
+  // The BOND IS KEPT intact. We must NOT delete the puck's bond: iOS has no API
+  // to forget its half, so a puck-only bond wipe leaves an asymmetric bond that
+  // blocks every future reconnect until the user manually "Forget"s the device.
+  // The "phantom ANCS reconnect" is instead made harmless two ways: (B) we drop
+  // the ANCS subscription here so iOS has less reason to reopen the link, and (A)
+  // a bare BLE connection is no longer treated as a session join (see joinUser),
+  // so even if iOS does reopen the link it never appears as a user.
+  while (g_discHead != g_discTail) {
+    uint16_t h = g_discQueue[g_discHead];
+    g_discHead = (uint8_t)((g_discHead + 1) % DISC_Q_SIZE);
+    ancsUnsubscribe(h);                      // (B) stop consuming ANCS, keep bond
+    Bluefruit.disconnect(h);
+    Serial.print("disconnect issued conn=0x"); Serial.println(h, HEX);
+  }
 
   // The puck owns the session clock: push it to every phone once a minute so
   // all devices stay in sync. (A baseline is also pushed on each join.)
@@ -502,6 +688,21 @@ void loop() {
     g_fxStartMS = now;
     g_fxStep    = 0;
     g_fxNextMS  = now;
+  }
+
+  // An allowlist-matched notification pulses the puck in that user's color. We
+  // only start it when no other FX is running so a join/leave animation isn't
+  // interrupted (a notification mid-FX is simply dropped — they arrive often).
+  if (g_notifyFx) {
+    g_notifyFx = false;
+    if (g_fxPhase == FxPhase::Idle) {
+      g_fxColor   = g_notifyColor;
+      g_fxPhase   = FxPhase::Pulse;
+      g_fxStartMS = now;
+      g_fxStep    = 0;                        // ramp index: even=up, odd=down
+      g_fxNextMS  = now;
+      playSound();
+    }
   }
 
   // Advance whichever FX is running once its frame/phase timer elapses.
@@ -557,6 +758,28 @@ void loop() {
         strip.show();
         g_fxPhase = FxPhase::Idle;
         break;
+
+      case FxPhase::Pulse: {                 // notification: ramp up/down N times
+        const uint32_t elapsed = now - g_fxStartMS;
+        if (elapsed >= NOTIFY_HALF_MS) {     // this ramp done -> next half-cycle
+          g_fxStep++;
+          g_fxStartMS = now;
+          if (g_fxStep >= (uint16_t)NOTIFY_PULSES * 2) {  // all pulses done -> off
+            strip.clear();
+            strip.show();
+            g_fxPhase = FxPhase::Idle;
+          } else {
+            g_fxNextMS = now;                // start the next ramp immediately
+          }
+        } else {                             // within a ramp: even=up, odd=down
+          const uint32_t frac = 255UL * elapsed / NOTIFY_HALF_MS;
+          const uint8_t  scale = (g_fxStep & 1) ? (uint8_t)(255 - frac)
+                                                : (uint8_t)frac;
+          showColorScaled(g_fxColor, scale);
+          g_fxNextMS = now + FX_FRAME_MS;
+        }
+        break;
+      }
 
       case FxPhase::Idle:
         break;
