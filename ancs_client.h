@@ -75,6 +75,12 @@ int      ancsSlotForHandle(uint16_t connHandle);
 /// Returns the connHandle bound to an ANCS slot (BLE_CONN_HANDLE_INVALID if free).
 uint16_t ancsConnHandle(uint8_t slotIndex);
 
+/// Diagnostic: log every active ANCS slot's lifecycle flags (chrs discovered /
+/// joined / ready), bound connHandle, allowlist size, queued-notification depth
+/// and in-flight-fetch state. Read-only; called from the orchestrator's
+/// heartbeat to make multi-connection issues visible in a field log.
+void ancsDumpState(void);
+
 /// Light trigger — IMPLEMENTED ELSEWHERE (modem_firmware.ino) as a stub.
 /// Called when an Added notification's app bundle ID matches slotIndex's
 /// allowlist. LED/animation actuation is out of scope here; the stub just logs.

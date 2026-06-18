@@ -56,6 +56,12 @@ struct User {
   uint8_t animationID;
   uint8_t soundID;
   uint16_t screenTime;
+  // Leave-grace bookkeeping. 0 = a live member. Non-zero = the link dropped
+  // spontaneously (NOT an app-requested leave) at this millis() timestamp; the
+  // user is held in the roster through LEAVE_GRACE_MS so a quick iOS reopen +
+  // app rejoin can reclaim the slot (see reclaimPendingLeave) without flickering
+  // off everyone else's leaderboard. loop() finalizes the leave if it expires.
+  uint32_t pendingLeaveMS;
 };
 
 /// Session

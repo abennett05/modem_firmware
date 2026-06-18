@@ -93,6 +93,11 @@ BLECharacteristic disconnChar(UUID_DISCONN);
 constexpr uint32_t SESSION_NOTIFY_MS = 60000;  // push session time every minute
 static uint32_t    g_lastSessMS      = 0;       // last session-time push
 
+// Diagnostic heartbeat cadence: how often loop() dumps full session + ANCS slot
+// state to Serial. The MVP test surfaced multi-connection bugs that only a live
+// log can pin down, so this stays on; it's a few cheap prints every few seconds.
+constexpr uint32_t HEARTBEAT_MS = 5000;
+
 /// Light-strip FX
 /// - - - - - - - - - - - -
 /// The BLE callbacks only raise a flag + the color; loop() runs the whole
@@ -145,6 +150,43 @@ constexpr uint8_t DISC_Q_SIZE = MAX_USERS + 1;
 static volatile uint16_t g_discQueue[DISC_Q_SIZE];
 static volatile uint8_t  g_discHead = 0;   // consumer (loop)
 static volatile uint8_t  g_discTail = 0;   // producer (callback)
+
+
+/// Leave grace + intentional-leave tracking
+/// - - - - - - - - - - - -
+/// On iOS the app link and the system ANCS link are the SAME GAP connection,
+/// which iOS drops and silently reopens on its own. So a spontaneous disconnect
+/// is usually transient: instead of evicting the member immediately (which blinks
+/// them off every other phone's leaderboard and kills their notifications), we
+/// hold them for LEAVE_GRACE_MS. A quick reconnect + identity re-write reclaims
+/// the slot (reclaimPendingLeave); if the grace expires, loop() finalizes the
+/// leave. An APP-REQUESTED leave (the fb59000B disconnect) is intentional and
+/// must finalize at once — those handles are recorded here so disconnectCallback
+/// can tell the two apart.
+constexpr uint32_t LEAVE_GRACE_MS = 6000;
+static uint16_t g_intentionalLeave[MAX_USERS];
+static uint8_t  g_intentionalLeaveCount = 0;
+
+// Record that conn_handle's upcoming disconnect was requested by the app (so it
+// finalizes immediately, not after the grace window). Deduplicated; bounded.
+static void markIntentionalLeave(uint16_t conn_handle) {
+  for (uint8_t i = 0; i < g_intentionalLeaveCount; i++)
+    if (g_intentionalLeave[i] == conn_handle) return;
+  if (g_intentionalLeaveCount < MAX_USERS)
+    g_intentionalLeave[g_intentionalLeaveCount++] = conn_handle;
+}
+
+// Was conn_handle's disconnect app-requested? Removes it from the set if so
+// (swap-with-last), so a later reused handle doesn't inherit the flag.
+static bool takeIntentionalLeave(uint16_t conn_handle) {
+  for (uint8_t i = 0; i < g_intentionalLeaveCount; i++) {
+    if (g_intentionalLeave[i] == conn_handle) {
+      g_intentionalLeave[i] = g_intentionalLeave[--g_intentionalLeaveCount];
+      return true;
+    }
+  }
+  return false;
+}
 
 
 /// Helpers
@@ -377,6 +419,68 @@ static void removeUser(uint16_t conn_handle) {
   if (g_session.userCount == 0) endSession();
 }
 
+// Finalize a member's departure: leave FX in their color, drop them from the
+// roster, and tell the remaining phones. Used both for an app-requested leave
+// (immediately, from disconnectCallback) and for a spontaneous drop whose grace
+// window expired without a reconnect (from loop()).
+static void finalizeLeave(uint16_t conn_handle) {
+  User* u = findUser(conn_handle);
+  if (!u) return;
+  g_fxColor      = colorOrFallback(u->color);
+  g_disconnectFx = true;
+  removeUser(conn_handle);
+  notifyUserCount();
+  notifyRoster();
+  Serial.print("leave finalized: users="); Serial.println(g_session.userCount);
+}
+
+// Re-adopt a member that dropped spontaneously and is now reconnecting. A drop
+// keeps the user in the roster (pendingLeaveMS set) but frees their old ANCS
+// slot; the phone then reconnects on a NEW connHandle and re-writes its color.
+// Colors are unique within a session (join-time collision resolution), so a
+// pending-leave user with this exact color IS the same person reclaiming their
+// seat: rebind them to the new handle, clear the grace flag, and keep their
+// accrued screen time. Returns the reclaimed user, or nullptr if none matched.
+static User* reclaimPendingLeave(uint16_t newHandle, uint32_t color) {
+  for (uint8_t i = 0; i < g_session.userCount; i++) {
+    User& u = g_session.connectedUsers[i];
+    if (u.pendingLeaveMS != 0 && u.color == color) {
+      Serial.print("reclaim: conn 0x"); Serial.print(u.connHandle, HEX);
+      Serial.print(" -> 0x"); Serial.println(newHandle, HEX);
+      u.connHandle     = newHandle;
+      u.pendingLeaveMS = 0;
+      return &u;
+    }
+  }
+  return nullptr;
+}
+
+// Periodic diagnostic dump (driven by the heartbeat in loop()): device state,
+// live link count, and each member's color / screen time / grace status,
+// followed by the per-slot ANCS state. Read-only — safe to call from loop().
+static void dumpState() {
+  Serial.print("MODEM_state t="); Serial.print(millis());
+  Serial.print(" state=");
+  Serial.print(CURR_STATE == State::Active ? "Active" : "Idle");
+  Serial.print(" links="); Serial.print(Bluefruit.connected());
+  Serial.print(" users="); Serial.println(g_session.userCount);
+  for (uint8_t i = 0; i < g_session.userCount; i++) {
+    const User& u = g_session.connectedUsers[i];
+    Serial.print("  user["); Serial.print(i); Serial.print("] conn=0x");
+    Serial.print(u.connHandle, HEX);
+    Serial.print(" color=0x"); Serial.print(u.color, HEX);
+    Serial.print(" stime="); Serial.print(u.screenTime);
+    Serial.print(" name=\""); Serial.print(u.name); Serial.print("\"");
+    if (u.pendingLeaveMS != 0) {
+      Serial.print(" [leaving ");
+      Serial.print(millis() - u.pendingLeaveMS);
+      Serial.print("ms]");
+    }
+    Serial.println();
+  }
+  ancsDumpState();
+}
+
 // Called whenever a central connects to the puck. A connection is NOT yet a
 // session join: we start ANCS (so notifications work) but defer addUser/roster/FX
 // until the phone sends its identity (see joinUser / onColorWrite). This is what
@@ -400,11 +504,11 @@ static void connectCallback(uint16_t conn_handle) {
 }
 
 // Called whenever a central disconnects.
-static void disconnectCallback(uint16_t conn_handle, uint8_t /*reason*/) {
+static void disconnectCallback(uint16_t conn_handle, uint8_t reason) {
   // Tear down this slot's ANCS client first (halt fetches, drop allowlist,
   // reset buffers). Always runs — even for a connection that never joined the
   // session (e.g. a phantom ANCS reconnect). Idempotent + matches the exact
-  // conn_handle; safe before the user slot is reclaimed.
+  // conn_handle; safe whether or not the user slot is reclaimed below.
   ancsOnDisconnect(conn_handle);
 
   // Only a connection that actually JOINED the session affects the roster/FX. A
@@ -416,18 +520,21 @@ static void disconnectCallback(uint16_t conn_handle, uint8_t /*reason*/) {
     return;
   }
 
-  // Capture the leaving member's color before their slot is reclaimed so loop()
-  // can flicker it out and then refresh the user gauge.
-  g_fxColor      = colorOrFallback(u->color);
-  g_disconnectFx = true;
-
-  removeUser(conn_handle);
-
-  // Tell the phones that remain the new roster size and user table.
-  notifyUserCount();
-  notifyRoster();
-
-  Serial.print("disconnect: users="); Serial.println(g_session.userCount);
+  if (takeIntentionalLeave(conn_handle)) {
+    // The app explicitly asked to leave (fb59000B) — finalize now, no grace.
+    Serial.print("BLE disconnect (intentional) conn=0x"); Serial.println(conn_handle, HEX);
+    finalizeLeave(conn_handle);
+  } else {
+    // Spontaneous drop (iOS churn / brief out-of-range). Hold the member through
+    // the grace window: leave the roster untouched so the OTHER phones don't see
+    // them blink out, and let a fast reconnect + color re-write reclaim the slot
+    // (reclaimPendingLeave). loop() finalizes the leave only if grace expires.
+    if (u->pendingLeaveMS == 0) u->pendingLeaveMS = millis();
+    Serial.print("BLE disconnect (spontaneous) conn=0x"); Serial.print(conn_handle, HEX);
+    Serial.print(" reason=0x"); Serial.print(reason, HEX);
+    Serial.print(" -> holding "); Serial.print(LEAVE_GRACE_MS);
+    Serial.println("ms for grace");
+  }
   // restartOnDisconnect(true) re-advertises automatically.
 }
 
@@ -471,6 +578,21 @@ static void onColorWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   buf[n] = '\0';
 
   uint32_t color = parseRGB(buf);
+
+  // Reconnect fast-path: if this color belongs to a member who just dropped and
+  // is still inside their leave grace, this write is them reclaiming their seat
+  // — rebind to the new connHandle (keeping screen time) and re-subscribe ANCS,
+  // instead of joining a duplicate that would later be removed by the grace
+  // sweep. Colors are unique per session, so a match here is unambiguous.
+  User* reclaimed = reclaimPendingLeave(conn_handle, color);
+  if (reclaimed) {
+    reclaimed->color = color;
+    ancsOnJoin(conn_handle);     // re-enable this user's notifications on the new slot
+    notifyRoster();              // resync any reader; the table itself is unchanged
+    g_fxColor   = colorOrFallback(color);
+    g_connectFx = true;
+    return;
+  }
 
   // First identity write joins this connection to the session (no-op if already).
   // A phantom ANCS reconnect never sends a color, so it never joins or animates.
@@ -659,6 +781,7 @@ void loop() {
   while (g_discHead != g_discTail) {
     uint16_t h = g_discQueue[g_discHead];
     g_discHead = (uint8_t)((g_discHead + 1) % DISC_Q_SIZE);
+    markIntentionalLeave(h);                 // app asked: finalize on its disconnect (no grace)
     ancsUnsubscribe(h);                      // (B) stop consuming ANCS, keep bond
     Bluefruit.disconnect(h);
     Serial.print("disconnect issued conn=0x"); Serial.println(h, HEX);
@@ -670,6 +793,29 @@ void loop() {
       (int32_t)(now - g_lastSessMS) >= (int32_t)SESSION_NOTIFY_MS) {
     g_lastSessMS = now;
     notifySessionTime();
+  }
+
+  // Leave-grace sweep: finalize any spontaneously-dropped member whose grace
+  // window expired with no reconnect. One per pass — finalizeLeave repacks the
+  // user array, so the rest are re-checked on the next loop.
+  if (CURR_STATE == State::Active) {
+    for (uint8_t i = 0; i < g_session.userCount; i++) {
+      const User& u = g_session.connectedUsers[i];
+      if (u.pendingLeaveMS != 0 &&
+          (int32_t)(now - u.pendingLeaveMS) >= (int32_t)LEAVE_GRACE_MS) {
+        Serial.print("leave grace expired conn=0x");
+        Serial.println(u.connHandle, HEX);
+        finalizeLeave(u.connHandle);
+        break;
+      }
+    }
+  }
+
+  // Diagnostic heartbeat: dump full session + ANCS slot state every few seconds.
+  static uint32_t s_lastHeartbeatMS = 0;
+  if ((int32_t)(now - s_lastHeartbeatMS) >= (int32_t)HEARTBEAT_MS) {
+    s_lastHeartbeatMS = now;
+    dumpState();
   }
 
   // A color write starts the connect FX: spin -> hold lit -> gauge -> off.

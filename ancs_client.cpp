@@ -539,3 +539,19 @@ void ancsService(void) {
     // else: BUSY/RESOURCES — leave UID at pendHead; retried next ancsService().
   }
 }
+
+void ancsDumpState(void) {
+  for (uint8_t i = 0; i < MAX_USERS; i++) {
+    const AncsSlot& s = g_slots[i];
+    if (!s.active) continue;
+    const uint8_t pend = (uint8_t)((s.pendTail - s.pendHead) & ANCS_PEND_MASK);
+    LOGP("slot="); Serial.print(i);
+    Serial.print(" conn=0x"); Serial.print(s.connHandle, HEX);
+    Serial.print(" chrs="); Serial.print(s.chrsFound);
+    Serial.print(" joined="); Serial.print(s.joined);
+    Serial.print(" ready="); Serial.print(s.ready);
+    Serial.print(" allow="); Serial.print(s.allowCount);
+    Serial.print(" pend="); Serial.print(pend);
+    Serial.print(" inFlight="); Serial.println(s.inFlight);
+  }
+}
