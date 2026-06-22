@@ -21,6 +21,10 @@ constexpr uint8_t MAX_DEVICE_NAME_LEN = 32;
 constexpr uint8_t MAX_USERS = 8;
 constexpr uint8_t MAX_KEYFRAMES = 32;
 constexpr uint8_t NUM_LIGHTS = 12;
+// Light brightness: the single source of truth for the NeoPixel strip's maximum
+// brightness (0..255 scale). The persisted settings default to this, the strip
+// is initialized to it, and the app's brightness slider maps "High" to it.
+constexpr uint8_t LIGHT_BRIGHTNESS_MAX = 150;
 // User Properties
 constexpr uint8_t MAX_USER_NAME_LEN = 24;
 

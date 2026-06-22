@@ -18,6 +18,7 @@
 #include <Adafruit_NeoPixel.h>
 #include "modem_types.h"
 #include "ancs_client.h"
+#include "puck_settings.h"
 
 /// Pins
 /// - - - - - - - - - - - -
@@ -55,6 +56,10 @@ static uint8_t const UUID_ALLOW[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,
 // the phone calls cancelPeripheralConnection, so the puck (the peripheral) must
 // initiate the GAP disconnect for the link to actually drop. See onDisconnectRequest.
 static uint8_t const UUID_DISCONN[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0b,0x00,0x59,0xfb};
+// brightness: NEW persisted light-brightness control. Selector 0x0C — NOT 0x06:
+// 0x06 is already UUID_COUNT (the session userCount characteristic). uint8 in
+// 0..LIGHT_BRIGHTNESS_MAX. Read/write, persisted, applied to the strip on write.
+static uint8_t const UUID_BRIGHT[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0c,0x00,0x59,0xfb};
 
 BLEService        modemSvc(UUID_SVC);
 BLECharacteristic ownerChar(UUID_OWNER);
@@ -88,10 +93,141 @@ constexpr uint16_t ALLOW_PAYLOAD_MAX = 256;
 // disconnect: the connected phone writes here to request that the puck drop its
 // link (peripheral-initiated GAP disconnect — see UUID_DISCONN). WRITE / WRITE_WO_RESP.
 BLECharacteristic disconnChar(UUID_DISCONN);
+// brightness: persisted light brightness (uint8, 0..LIGHT_BRIGHTNESS_MAX). READ +
+// WRITE: the owning phone reads the current value and writes a new one; the puck
+// applies it to the strip and persists it. See onBrightnessWrite.
+BLECharacteristic brightChar(UUID_BRIGHT);
 
 // Cadence + bookkeeping for the once-a-minute session-time broadcast.
 constexpr uint32_t SESSION_NOTIFY_MS = 60000;  // push session time every minute
 static uint32_t    g_lastSessMS      = 0;       // last session-time push
+
+/// Battery level (standard BLE Battery Service 0x180F / 0x2A19)
+/// - - - - - - - - - - - -
+/// The puck reports its battery as a 0..100% level over the standard Battery
+/// Service so the app (and any generic BLE tool) can read/subscribe it.
+///
+/// This board is a SuperMini nRF52840 (Nice!Nano clone). Its on-board battery
+/// divider is miswired to P0.24, which is NOT an ADC-capable pin, so the old
+/// external-pin read was invalid. We instead read the SAADC's internal
+/// VDDHDIV5 input: the battery feeds VDDH on this board, and VDDHDIV5 measures
+/// VDDH/5 with no external pin and no external divider.
+BLEBas blebas;                                   // Bluefruit's Battery Service helper
+constexpr uint32_t BATTERY_SAMPLE_MS = 30000;    // re-measure + push every 30s
+static uint32_t    g_lastBatteryMS   = 0;
+static uint8_t     g_batteryPercent  = 0;
+
+// VDDHDIV5 conversion. With the internal 0.6V reference and gain 1/6
+// (AR_INTERNAL) the SAADC's full-scale input is 3.6V at 12-bit (0..4095). The
+// internal input presents VDDH/5, so:
+//   ADC input mV = raw * (3600.0 / 4096.0)     // = VDDH / 5
+//   battery  mV  = ADC input mV * 5            // undo the internal /5 divider
+// A 3.7-4.2V cell -> VDDH/5 = 0.74-0.84V, comfortably inside the 3.6V span.
+#define VDDH_FULLSCALE_MV (3600.0F)              // 0.6V ref x6 (AR_INTERNAL), 12-bit
+#define VDDH_ADC_MAX      (4096.0F)
+#define VDDHDIV5_RATIO    (5.0F)                 // VDDHDIV5 = VDDH / 5
+
+// Raw ADC count from the most recent battery read, kept for the serial log.
+static uint16_t g_lastVbatRaw = 0;
+
+// True while USB/VBUS is present. While charging/USB-powered VDDH rises above
+// the true cell voltage, so the reading is NOT a valid state-of-charge.
+static bool g_usbPresent = false;
+
+// VBUS present? The SoftDevice is enabled (BLE) and guards the POWER
+// peripheral, so query USB regulator status through the SD rather than reading
+// NRF_POWER directly.
+static bool isUsbPresent() {
+  uint32_t usbreg = 0;
+  if (sd_power_usbregstatus_get(&usbreg) != NRF_SUCCESS) return false;
+  return (usbreg & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+}
+
+// Read the battery voltage in millivolts via the internal VDDHDIV5 input.
+// This core (1.6.x) has no analogReadVDDHDIV5() wrapper and its analogRead
+// helper is private, so we drive the SAADC directly: single-ended, 12-bit,
+// internal 0.6V reference, gain 1/6 -> 3.6V full scale. We average 8 samples
+// (after a throwaway settling read) to reject noise, then disable the SAADC.
+// The core's analogRead() reconfigures the SAADC fully on every call, so no
+// global ADC state needs saving/restoring here.
+static float readBatteryMv() {
+  NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit;
+  NRF_SAADC->ENABLE     = (SAADC_ENABLE_ENABLE_Enabled << SAADC_ENABLE_ENABLE_Pos);
+  for (int i = 0; i < 8; i++) {
+    NRF_SAADC->CH[i].PSELN = SAADC_CH_PSELP_PSELP_NC;
+    NRF_SAADC->CH[i].PSELP = SAADC_CH_PSELP_PSELP_NC;
+  }
+  NRF_SAADC->CH[0].CONFIG =
+      ((SAADC_CH_CONFIG_RESP_Bypass       << SAADC_CH_CONFIG_RESP_Pos)   & SAADC_CH_CONFIG_RESP_Msk)
+    | ((SAADC_CH_CONFIG_RESP_Bypass       << SAADC_CH_CONFIG_RESN_Pos)   & SAADC_CH_CONFIG_RESN_Msk)
+    | ((SAADC_CH_CONFIG_GAIN_Gain1_6      << SAADC_CH_CONFIG_GAIN_Pos)   & SAADC_CH_CONFIG_GAIN_Msk)
+    | ((SAADC_CH_CONFIG_REFSEL_Internal   << SAADC_CH_CONFIG_REFSEL_Pos) & SAADC_CH_CONFIG_REFSEL_Msk)
+    | ((SAADC_CH_CONFIG_TACQ_10us         << SAADC_CH_CONFIG_TACQ_Pos)   & SAADC_CH_CONFIG_TACQ_Msk)
+    | ((SAADC_CH_CONFIG_MODE_SE           << SAADC_CH_CONFIG_MODE_Pos)   & SAADC_CH_CONFIG_MODE_Msk);
+  NRF_SAADC->CH[0].PSELP = SAADC_CH_PSELP_PSELP_VDDHDIV5;
+  NRF_SAADC->CH[0].PSELN = SAADC_CH_PSELP_PSELP_VDDHDIV5;
+
+  uint32_t acc = 0;
+  constexpr uint8_t N = 8;
+  for (uint8_t i = 0; i < N + 1; i++) {     // i == 0 is a throwaway settling read
+    volatile int16_t value = 0;
+    NRF_SAADC->RESULT.PTR    = (uint32_t)&value;
+    NRF_SAADC->RESULT.MAXCNT = 1;
+
+    NRF_SAADC->TASKS_START = 0x01UL;
+    while (!NRF_SAADC->EVENTS_STARTED);
+    NRF_SAADC->EVENTS_STARTED = 0x00UL;
+
+    NRF_SAADC->TASKS_SAMPLE = 0x01UL;
+    while (!NRF_SAADC->EVENTS_END);
+    NRF_SAADC->EVENTS_END = 0x00UL;
+
+    NRF_SAADC->TASKS_STOP = 0x01UL;
+    while (!NRF_SAADC->EVENTS_STOPPED);
+    NRF_SAADC->EVENTS_STOPPED = 0x00UL;
+
+    if (value < 0) value = 0;
+    if (i > 0) acc += (uint16_t)value;
+  }
+  NRF_SAADC->ENABLE = (SAADC_ENABLE_ENABLE_Disabled << SAADC_ENABLE_ENABLE_Pos);
+
+  g_lastVbatRaw = (uint16_t)(acc / N);
+  return g_lastVbatRaw * (VDDH_FULLSCALE_MV / VDDH_ADC_MAX) * VDDHDIV5_RATIO;
+}
+
+// Map a LiPo cell voltage (mV) to a rough 0..100% charge (Adafruit's curve).
+static uint8_t mvToPercent(float mvolts) {
+  if (mvolts < 3300) return 0;
+  if (mvolts < 3600) { mvolts -= 3300; return (uint8_t)(mvolts / 30); }
+  mvolts -= 3600;
+  uint16_t pct = 10 + (uint16_t)(mvolts * 0.15F);   // 3.6V..4.2V -> 10..100%
+  return pct > 100 ? 100 : (uint8_t)pct;
+}
+
+// Sample the battery and publish it on the Battery Service (value + notify).
+// Logs the raw ADC count, the computed battery millivolts, and the percent so
+// the reading can be verified / calibrated on the serial monitor.
+static void sampleBattery() {
+  const float mv = readBatteryMv();
+  g_usbPresent   = isUsbPresent();
+
+  // While charging/USB-powered VDDH is inflated by the charger, so skip the
+  // percent update (keep the last battery-power level) instead of reporting a
+  // misleadingly high state-of-charge.
+  if (g_usbPresent) {
+    Serial.print("MODEM_BATT raw="); Serial.print(g_lastVbatRaw);
+    Serial.print(" mv=");            Serial.print(mv, 1);
+    Serial.println(" CHARGING (VDDH inflated; percent update suppressed)");
+    return;
+  }
+
+  g_batteryPercent = mvToPercent(mv);
+  blebas.write(g_batteryPercent);
+  blebas.notify(g_batteryPercent);
+  Serial.print("MODEM_BATT raw="); Serial.print(g_lastVbatRaw);
+  Serial.print(" mv=");            Serial.print(mv, 1);
+  Serial.print(" pct=");           Serial.println(g_batteryPercent);
+}
 
 // Diagnostic heartbeat cadence: how often loop() dumps full session + ANCS slot
 // state to Serial. The MVP test surfaced multi-connection bugs that only a live
@@ -137,6 +273,11 @@ constexpr uint32_t GAUGE_MS      = 600;   // user-count display duration
 /// down (Idle) once the last user leaves.
 State   CURR_STATE = State::Idle;
 Session g_session;
+
+// Live mirror of the persisted soundEnabled flag (puckSettings().soundEnabled),
+// kept here so the FX/audio path can gate playback without re-reading flash on
+// every effect. Seeded from flash in setup(), updated on a Sound write.
+static bool g_soundEnabled = true;
 
 /// Phone-requested disconnect queue
 /// - - - - - - - - - - - -
@@ -250,6 +391,7 @@ static void showSpin(uint32_t c, uint16_t head) {
 // Hardware will drive a speaker rather than the prototype's buzzer; the
 // audio path (I2S / PWM / DAC + pin assignment) is still pending.
 static void playSound() {
+  if (!g_soundEnabled) return;   // honor the persisted Sound setting
   // intentionally empty - to be implemented
 }
 
@@ -493,8 +635,10 @@ static void connectCallback(uint16_t conn_handle) {
   ancsOnConnect(conn_handle, 0xFF);
 
   // Write the device name back to the phone: push it as a notification
-  // (the characteristic value is also readable as a fallback).
-  nameChar.notify(conn_handle, DEVICE_NAME, strlen(DEVICE_NAME));
+  // (the characteristic value is also readable as a fallback). Sourced from the
+  // persisted settings so a renamed puck reports its current name on connect.
+  const char* puckName = puckSettings().name;
+  nameChar.notify(conn_handle, puckName, strlen(puckName));
 
   Serial.print("BLE connect: links="); Serial.println(Bluefruit.connected());
 
@@ -625,6 +769,89 @@ static void onAllowlistWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   ancsSetAllowlist((uint8_t)slot, data, len);
 }
 
+// Owner (claim) write-callback. The phone writes a 16-byte key to claim an
+// unclaimed puck or to take over a claimed one. Claim semantics:
+//   - UNCLAIMED            -> adopt the key, claim, RESET settings to DEFAULTS.
+//   - CLAIMED, same key    -> NO-OP (guards reconnect re-sends of the same key).
+//   - CLAIMED, diff key    -> takeover: overwrite the key, RESET to DEFAULTS.
+// ANY ownership change resets name/sound/brightness to DEFAULTS (keeping the new
+// key). The readable Owner value is a 0/1 owned-flag (the raw key is never read
+// back). Firmware trusts the write; the app gates takeover behind a confirmation.
+static void onOwnerWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
+                         uint8_t* data, uint16_t len) {
+  if (len != PUCK_OWNER_KEY_LEN) {
+    Serial.print("owner write ignored: len="); Serial.println(len);
+    return;
+  }
+  PuckSettings& s = puckSettings();
+  if (s.claimed && memcmp(s.ownerKey, data, PUCK_OWNER_KEY_LEN) == 0) {
+    Serial.println("owner write: same key -> no-op");
+    return;                        // reconnect re-send: never reset, never rewrite flash
+  }
+
+  // Unclaimed -> claim, or a different key -> takeover. Adopt the new key, mark
+  // claimed, and reset the content settings to DEFAULTS (reset keeps the key).
+  memcpy(s.ownerKey, data, PUCK_OWNER_KEY_LEN);
+  s.claimed = 1;
+  puckSettingsResetToDefaults();
+  puckSettingsSave();
+
+  // Apply the freshly-reset state to the hardware + readable characteristics.
+  g_soundEnabled = s.soundEnabled;
+  strip.setBrightness(s.brightness);
+  ownerChar.write8(s.claimed);     // owned-flag now reads 1
+  nameChar.write(s.name);
+  soundChar.write8(s.soundEnabled);
+  brightChar.write8(s.brightness);
+  // Echo the (default) name back to the claiming phone so it reads defaults.
+  nameChar.notify(conn_handle, s.name, strlen(s.name));
+  Serial.println("owner write: claimed/took over -> settings reset to DEFAULTS");
+}
+
+// Name write-callback: rename the device. Stored in the persisted settings
+// (debounced) and reflected in the readable Name characteristic value.
+static void onNameWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
+                        uint8_t* data, uint16_t len) {
+  PuckSettings& s = puckSettings();
+  uint16_t n = len < MAX_DEVICE_NAME_LEN - 1 ? len : MAX_DEVICE_NAME_LEN - 1;
+  memcpy(s.name, data, n);
+  s.name[n] = '\0';
+  puckSettingsSave();
+  nameChar.write(s.name);
+  nameChar.notify(conn_handle, s.name, strlen(s.name));
+  Serial.print("name write -> "); Serial.println(s.name);
+}
+
+// Sound write-callback: enable/disable interaction sound. Persisted + mirrored
+// to g_soundEnabled (which playSound honors) and the readable Sound value.
+static void onSoundWrite(uint16_t /*conn_handle*/, BLECharacteristic* /*chr*/,
+                         uint8_t* data, uint16_t len) {
+  if (len < 1) return;
+  PuckSettings& s = puckSettings();
+  s.soundEnabled = data[0] ? 1 : 0;
+  puckSettingsSave();
+  g_soundEnabled = s.soundEnabled;
+  soundChar.write8(s.soundEnabled);
+  Serial.print("sound write -> "); Serial.println(s.soundEnabled);
+}
+
+// Brightness write-callback: set the light brightness (clamped to
+// 0..LIGHT_BRIGHTNESS_MAX). Persisted, applied to the strip, and mirrored to the
+// readable Brightness value. strip.show() re-renders whatever is currently lit
+// so a change is visible immediately when an effect is on screen.
+static void onBrightnessWrite(uint16_t /*conn_handle*/, BLECharacteristic* /*chr*/,
+                              uint8_t* data, uint16_t len) {
+  if (len < 1) return;
+  PuckSettings& s = puckSettings();
+  uint8_t b = data[0] > LIGHT_BRIGHTNESS_MAX ? LIGHT_BRIGHTNESS_MAX : data[0];
+  s.brightness = b;
+  puckSettingsSave();
+  strip.setBrightness(b);
+  strip.show();
+  brightChar.write8(s.brightness);
+  Serial.print("brightness write -> "); Serial.println(s.brightness);
+}
+
 // Bluefruit write-callback for the disconnect characteristic. The connected
 // phone writes here (the payload is ignored — any write is a request) to ask the
 // puck to sever ITS side of the link. We only ENQUEUE the writing connHandle;
@@ -642,13 +869,24 @@ static void onDisconnectRequest(uint16_t conn_handle, BLECharacteristic* /*chr*/
 void setup() {
   Serial.begin(115200);
 
+  // Persistent settings: mount flash + load the record (or seed DEFAULTS on a
+  // blank/old board) BEFORE the lights so the strip comes up at the saved
+  // brightness and the sound flag is in effect from the first interaction.
+  puckSettingsBegin();
+  g_soundEnabled = puckSettings().soundEnabled;
+
   // Lights: init first, then sit at the idle (cleared) color.
   strip.begin();
-  strip.setBrightness(150);
+  strip.setBrightness(puckSettings().brightness);
   strip.clear();
   strip.show();
 
   // BLE: Bluefruit peripheral + GATT server.
+  // Give the GATT attribute table extra headroom so the full characteristic set
+  // (incl. the brightness + claim additions and the large roster/allowlist value
+  // buffers) always registers — an overflow here silently drops characteristics.
+  // Must be configured BEFORE Bluefruit.begin().
+  Bluefruit.configAttrTableSize(0x1000);
   // Allow up to MAX_USERS concurrent peripheral connections.
   Bluefruit.begin(MAX_USERS);
   Bluefruit.setTxPower(4);
@@ -658,24 +896,40 @@ void setup() {
   // Parent service must begin() before the characteristics it owns.
   modemSvc.begin();
 
-  ownerChar.setProperties(CHR_PROPS_READ);
-  ownerChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
-  ownerChar.setMaxLen(MAX_USER_NAME_LEN);
+  // Owner: claim/takeover target. READ returns a 0/1 owned-flag (the raw key is
+  // never read back); WRITE takes the phone's 16-byte claim key (see onOwnerWrite).
+  ownerChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE);
+  ownerChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  ownerChar.setMaxLen(PUCK_OWNER_KEY_LEN);
+  ownerChar.setWriteCallback(onOwnerWrite);
   ownerChar.begin();
-  ownerChar.write("Owner");
+  ownerChar.write8(puckSettings().claimed);   // owned-flag
 
-  // READ + NOTIFY so the puck can push its name back to connected phones.
-  nameChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
-  nameChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  // Name: device name. READ + NOTIFY (pushed on connect) + WRITE to rename. The
+  // value is sourced from the persisted settings (see onNameWrite).
+  nameChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE | CHR_PROPS_NOTIFY);
+  nameChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
   nameChar.setMaxLen(MAX_DEVICE_NAME_LEN);
+  nameChar.setWriteCallback(onNameWrite);
   nameChar.begin();
-  nameChar.write(DEVICE_NAME);
+  nameChar.write(puckSettings().name);
 
-  // Sound write target retained for parity with the prototype's GATT table.
-  soundChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
-  soundChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  // Sound: enable/disable interaction sound. READ + WRITE, persisted.
+  soundChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  soundChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
   soundChar.setMaxLen(1);
+  soundChar.setWriteCallback(onSoundWrite);
   soundChar.begin();
+  soundChar.write8(puckSettings().soundEnabled);
+
+  // Brightness: light brightness (uint8, 0..LIGHT_BRIGHTNESS_MAX). READ + WRITE,
+  // persisted, applied to the strip on write (see onBrightnessWrite).
+  brightChar.setProperties(CHR_PROPS_READ | CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  brightChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  brightChar.setMaxLen(1);
+  brightChar.setWriteCallback(onBrightnessWrite);
+  brightChar.begin();
+  brightChar.write8(puckSettings().brightness);
 
   colorChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
   colorChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
@@ -739,6 +993,13 @@ void setup() {
   disconnChar.setMaxLen(1);
   disconnChar.setWriteCallback(onDisconnectRequest);
   disconnChar.begin();
+
+  // Standard Battery Service (0x180F): exposes the puck's 0..100% level for the
+  // app's home-screen indicator. Begun after Bluefruit.begin(); seed it with an
+  // initial reading so a phone that connects/reads early gets a real value.
+  blebas.begin();
+  sampleBattery();
+  g_lastBatteryMS = millis();
 
   // Per-slot ANCS consumer: registers the per-connection ANCS client services
   // and the secured-link callback. Must come after Bluefruit.begin().
@@ -809,6 +1070,12 @@ void loop() {
         break;
       }
     }
+  }
+
+  // Battery: re-measure periodically and push the fresh level to subscribers.
+  if ((int32_t)(now - g_lastBatteryMS) >= (int32_t)BATTERY_SAMPLE_MS) {
+    g_lastBatteryMS = now;
+    sampleBattery();
   }
 
   // Diagnostic heartbeat: dump full session + ANCS slot state every few seconds.
