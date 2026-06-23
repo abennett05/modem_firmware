@@ -60,6 +60,11 @@ struct User {
   uint8_t animationID;
   uint8_t soundID;
   uint16_t screenTime;
+  // Phone PICKUPS (device unlocks) attributed to this user this session, counted
+  // from the per-phone pickup writes (onPickupWrite). Broadcast in the roster so
+  // every phone can render the live pickups leaderboard. Zero-initialized on join
+  // and preserved across a spontaneous drop+reclaim (reclaimPendingLeave).
+  uint16_t pickups;
   // Leave-grace bookkeeping. 0 = a live member. Non-zero = the link dropped
   // spontaneously (NOT an app-requested leave) at this millis() timestamp; the
   // user is held in the roster through LEAVE_GRACE_MS so a quick iOS reopen +

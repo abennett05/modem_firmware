@@ -60,6 +60,25 @@ static uint8_t const UUID_DISCONN[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba
 // 0x06 is already UUID_COUNT (the session userCount characteristic). uint8 in
 // 0..LIGHT_BRIGHTNESS_MAX. Read/write, persisted, applied to the strip on write.
 static uint8_t const UUID_BRIGHT[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0c,0x00,0x59,0xfb};
+// pickup: PRODUCTION per-phone unlock-event sink. Selector 0x0D — the next free
+// selector after brightness (0x0C). Each phone reports its own "pickup" (an
+// unlock, used as a proxy for picking the phone up) here while it is in a session
+// and connected, including while backgrounded+locked over the iOS background
+// CoreBluetooth path. The puck attributes the event to a user BY COLOR (the
+// reporter rides its OWN background connection, not the app's session link, so
+// the writing connHandle is NOT the session user's) and logs it for puck-side
+// aggregation. WRITE / WRITE_WO_RESP. See onPickupWrite. (Replaces the removed
+// Phase-0 throwaway test sink that lived at selector 0x00FE.)
+static uint8_t const UUID_PICKUP[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0d,0x00,0x59,0xfb};
+// spike: group-level pickup-SPIKE trigger. Selector 0x0E — next free after
+// pickup (0x0D). READ + NOTIFY: the puck aggregates pickup events across ALL
+// connected phones and, when the group's pickup rate spikes (the conversation
+// has drifted), notifies here so the next layer (question selection) can react.
+// Payload (4 bytes, little-endian): [0..1] spikeSeq uint16 (increments once per
+// fired spike — the edge to act on), [2] pickupCount in window, [3] distinct
+// slots involved. See detectPickupSpike / notifySpike. Aggregate only; the puck
+// never exposes a per-user pickup metric.
+static uint8_t const UUID_SPIKE[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0e,0x00,0x59,0xfb};
 
 BLEService        modemSvc(UUID_SVC);
 BLECharacteristic ownerChar(UUID_OWNER);
@@ -97,6 +116,11 @@ BLECharacteristic disconnChar(UUID_DISCONN);
 // WRITE: the owning phone reads the current value and writes a new one; the puck
 // applies it to the strip and persists it. See onBrightnessWrite.
 BLECharacteristic brightChar(UUID_BRIGHT);
+// pickup: production per-phone unlock-event sink (UUID_PICKUP). WRITE /
+// WRITE_WO_RESP only — the phone never reads it back. See onPickupWrite.
+BLECharacteristic pickupChar(UUID_PICKUP);
+// spike: group pickup-spike trigger (UUID_SPIKE). READ + NOTIFY. See notifySpike.
+BLECharacteristic spikeChar(UUID_SPIKE);
 
 // Cadence + bookkeeping for the once-a-minute session-time broadcast.
 constexpr uint32_t SESSION_NOTIFY_MS = 60000;  // push session time every minute
@@ -451,9 +475,10 @@ static void notifySessionTime() {
 // Serialize the connected-user table and push it to every phone so each can
 // render the full leaderboard. Layout (little-endian):
 //   [0]    userCount
-//   per user: R, G, B, screenTime(uint16), nameLen, name[nameLen]
-// The characteristic value is kept current so a fresh reader sees the roster
-// without waiting for the next change.
+//   per user: R, G, B, pickups(uint16), nameLen, name[nameLen]
+// The per-user uint16 carries this user's PICKUP count (phone unlocks) so each
+// phone can render the pickups leaderboard. The characteristic value is kept
+// current so a fresh reader sees the roster without waiting for the next change.
 static void notifyRoster() {
   uint8_t buf[1 + MAX_USERS * (3 + 2 + 1 + MAX_USER_NAME_LEN)];
   uint16_t n = 0;
@@ -463,8 +488,8 @@ static void notifyRoster() {
     buf[n++] = (uint8_t)((u.color >> 16) & 0xFF);   // R
     buf[n++] = (uint8_t)((u.color >>  8) & 0xFF);   // G
     buf[n++] = (uint8_t)( u.color        & 0xFF);   // B
-    buf[n++] = (uint8_t)( u.screenTime        & 0xFF);
-    buf[n++] = (uint8_t)((u.screenTime >>  8) & 0xFF);
+    buf[n++] = (uint8_t)( u.pickups        & 0xFF);
+    buf[n++] = (uint8_t)((u.pickups >>  8) & 0xFF);
     uint8_t len = (uint8_t)strnlen(u.name, MAX_USER_NAME_LEN);
     buf[n++] = len;
     memcpy(&buf[n], u.name, len);
@@ -492,10 +517,15 @@ static void startSession() {
   Serial.println(" started -> Active");
 }
 
+// Defined later (with the spike-detection block); declared here so endSession can
+// clear the rolling window + cooldown when the last user leaves.
+static void resetPickupSpikeState();
+
 // Last user out -> tear the session down and go Idle.
 static void endSession() {
   g_session.startTimeMS = 0;
   CURR_STATE = State::Idle;
+  resetPickupSpikeState();        // fresh session starts quiet + responsive
   Serial.println("session ended -> Idle");
 }
 
@@ -612,6 +642,7 @@ static void dumpState() {
     Serial.print(u.connHandle, HEX);
     Serial.print(" color=0x"); Serial.print(u.color, HEX);
     Serial.print(" stime="); Serial.print(u.screenTime);
+    Serial.print(" pickups="); Serial.print(u.pickups);
     Serial.print(" name=\""); Serial.print(u.name); Serial.print("\"");
     if (u.pendingLeaveMS != 0) {
       Serial.print(" [leaving ");
@@ -866,6 +897,199 @@ static void onDisconnectRequest(uint16_t conn_handle, BLECharacteristic* /*chr*/
   g_discTail = nextTail;
 }
 
+// Find a CURRENT session member by their packed color (0x00RRGGBB), or nullptr.
+// Colors are unique per session (collisions are resolved at join), so a match is
+// unambiguous. This is how a pickup write is attributed to a user: the reporter
+// rides its own background BLE connection, so its connHandle is NOT the session
+// user's — color is the stable per-user handle the app already owns.
+static User* findUserByColor(uint32_t color) {
+  for (uint8_t i = 0; i < g_session.userCount; i++)
+    if (g_session.connectedUsers[i].color == color)
+      return &g_session.connectedUsers[i];
+  return nullptr;
+}
+
+// ===== Group pickup-SPIKE detection =====
+// Aggregate pickup events from ALL connected phones and fire a single group-level
+// SPIKE when the group's pickup rate jumps — the signal that the conversation has
+// drifted and a question should be offered. Aggregate, NOT per-user: a spike
+// requires multiple DISTINCT users picking up in a short window, so one person
+// fidgeting can never trigger it. The next layer (question selection) consumes
+// the spike via the UUID_SPIKE characteristic; we only detect and emit here.
+//
+// These thresholds are deliberately simple and WILL need empirical tuning on real
+// sessions — keep them here as named constants. Pickup reporting is lossy
+// (background BLE gaps), so this detects a TREND and is robust to missing events.
+constexpr uint32_t PICKUP_WINDOW_MS           = 20000;   // sliding aggregate window
+constexpr uint8_t  PICKUP_SPIKE_THRESHOLD     = 3;       // pickups in window to fire
+constexpr uint8_t  PICKUP_SPIKE_MIN_SLOTS     = 2;       // distinct users required (>1)
+constexpr uint32_t PICKUP_COOLDOWN_MS         = 120000;  // base min gap between spikes
+constexpr uint32_t PICKUP_COOLDOWN_BACKOFF_MS = 60000;   // added when drift persists
+constexpr uint32_t PICKUP_COOLDOWN_MAX_MS     = 300000;  // cap on cooldown growth
+constexpr uint32_t PICKUP_DRIFT_GRACE_MS      = 30000;   // re-fire within cooldown+this => still drifting
+constexpr uint8_t  PICKUP_EVENT_CAP           = 32;      // recent-event buffer size
+
+// Receipt-time windowing: events carry phone-side monotonic timestamps from
+// DIFFERENT devices with no shared clock, so we window on the puck's own millis()
+// receipt time and treat the phone timestamp as an ordering hint only.
+struct PickupEvent { uint32_t recvMS; uint8_t slot; };
+static PickupEvent g_pickupWin[PICKUP_EVENT_CAP];
+static uint8_t  g_pickupWinCount   = 0;
+static uint32_t g_lastSpikeMS      = 0;                  // 0 = none fired yet
+static uint32_t g_spikeCooldownMS  = PICKUP_COOLDOWN_MS; // current (escalating) cooldown
+static uint16_t g_spikeSeq         = 0;                  // increments once per fired spike
+
+// Drop events that have aged out of the sliding window (compacting in place).
+// (uint32_t) subtraction handles millis() wrap as long as the window << ~49 days.
+static void prunePickupWindow(uint32_t now) {
+  uint8_t w = 0;
+  for (uint8_t i = 0; i < g_pickupWinCount; i++)
+    if ((uint32_t)(now - g_pickupWin[i].recvMS) <= PICKUP_WINDOW_MS)
+      g_pickupWin[w++] = g_pickupWin[i];
+  g_pickupWinCount = w;
+}
+
+// Reset all spike state — called when a session ends so a fresh session starts
+// quiet and responsive (no stale window or escalated cooldown carried over).
+static void resetPickupSpikeState() {
+  g_pickupWinCount  = 0;
+  g_lastSpikeMS     = 0;
+  g_spikeCooldownMS = PICKUP_COOLDOWN_MS;
+}
+
+// Push a fired spike to every connected phone (and keep the readable value
+// current for a late reader). Payload: [0..1] seq LE, [2] count, [3] distinct.
+static void notifySpike(uint8_t count, uint8_t distinct) {
+  uint8_t buf[4];
+  buf[0] = (uint8_t)(g_spikeSeq & 0xFF);
+  buf[1] = (uint8_t)((g_spikeSeq >> 8) & 0xFF);
+  buf[2] = count;
+  buf[3] = distinct;
+  spikeChar.write(buf, sizeof(buf));
+  for (uint8_t i = 0; i < g_session.userCount; i++)
+    spikeChar.notify(g_session.connectedUsers[i].connHandle, buf, sizeof(buf));
+}
+
+// Record one attributed pickup (resolved slot + puck receipt time) and decide
+// whether the group just spiked. Sparse beats frequent: a fire is gated by a
+// cooldown, and if the group keeps drifting (re-fires right as the cooldown lifts)
+// the cooldown LENGTHENS rather than the system getting louder.
+static void recordPickupAndDetectSpike(uint8_t slot, uint32_t now) {
+  prunePickupWindow(now);
+  if (g_pickupWinCount < PICKUP_EVENT_CAP) {
+    g_pickupWin[g_pickupWinCount++] = {now, slot};
+  } else {
+    // Window saturated (very busy) — drop the oldest to make room.
+    for (uint8_t i = 1; i < PICKUP_EVENT_CAP; i++) g_pickupWin[i - 1] = g_pickupWin[i];
+    g_pickupWin[PICKUP_EVENT_CAP - 1] = {now, slot};
+  }
+
+  // Count distinct slots in the window (slot is a User.ID, 0..MAX_USERS-1).
+  uint16_t slotMask = 0;
+  uint8_t  distinct = 0;
+  for (uint8_t i = 0; i < g_pickupWinCount; i++) {
+    uint8_t s = g_pickupWin[i].slot;
+    if (s < 16 && !(slotMask & (uint16_t)(1u << s))) {
+      slotMask |= (uint16_t)(1u << s);
+      distinct++;
+    }
+  }
+
+  const bool crossed   = g_pickupWinCount >= PICKUP_SPIKE_THRESHOLD &&
+                         distinct >= PICKUP_SPIKE_MIN_SLOTS;
+  const bool inCooldown = g_lastSpikeMS != 0 &&
+                          (uint32_t)(now - g_lastSpikeMS) < g_spikeCooldownMS;
+
+  Serial.print("MODEM_SPIKE window count="); Serial.print(g_pickupWinCount);
+  Serial.print(" distinct=");                Serial.print(distinct);
+  Serial.print(" thresh=");                  Serial.print(PICKUP_SPIKE_THRESHOLD);
+  Serial.print(" crossed=");                 Serial.print(crossed ? 1 : 0);
+  Serial.print(" cooldown=");                Serial.print(inCooldown ? 1 : 0);
+  Serial.print(" cooldownMS=");              Serial.println(g_spikeCooldownMS);
+
+  if (!crossed) return;
+  if (inCooldown) {
+    // Threshold met but we recently fired — stay quiet. Continued crossings here
+    // are exactly the "ignored spark" the backoff below will make quieter.
+    Serial.print("MODEM_SPIKE suppressed (cooldown, ");
+    Serial.print(g_spikeCooldownMS - (uint32_t)(now - g_lastSpikeMS));
+    Serial.println("ms left)");
+    return;
+  }
+
+  // Fire. Adjust the NEXT cooldown based on how soon this fired after the last:
+  //   - re-fired within (cooldown + grace) => group kept drifting => LENGTHEN.
+  //   - long calm since the last spike      => drift resolved     => RESET to base.
+  if (g_lastSpikeMS != 0 &&
+      (uint32_t)(now - g_lastSpikeMS) < g_spikeCooldownMS + PICKUP_DRIFT_GRACE_MS) {
+    uint32_t grown = g_spikeCooldownMS + PICKUP_COOLDOWN_BACKOFF_MS;
+    g_spikeCooldownMS = grown > PICKUP_COOLDOWN_MAX_MS ? PICKUP_COOLDOWN_MAX_MS : grown;
+    Serial.print("MODEM_SPIKE backoff -> cooldown grows to "); Serial.println(g_spikeCooldownMS);
+  } else {
+    g_spikeCooldownMS = PICKUP_COOLDOWN_MS;
+  }
+  g_lastSpikeMS = now;
+  g_spikeSeq++;
+  Serial.print("MODEM_SPIKE FIRE seq="); Serial.print(g_spikeSeq);
+  Serial.print(" count=");               Serial.print(g_pickupWinCount);
+  Serial.print(" distinct=");            Serial.println(distinct);
+  notifySpike(g_pickupWinCount, distinct);
+}
+// ===== END group pickup-spike detection =====
+
+// Write-callback for the production pickup characteristic (UUID_PICKUP). Each
+// phone writes one event per UNLOCK (protectedDataDidBecomeAvailable; lock is NOT
+// a pickup) while it is in a session and connected, including backgrounded+locked.
+// Payload (11 bytes):
+//   [0]    R        uint8     — writing user's color, the per-user handle
+//   [1]    G        uint8
+//   [2]    B        uint8
+//   [3..10] phoneMs uint64 LE — phone monotonic (systemUptime) ms of the unlock
+// We attribute the raw event to its user by color, log it (MODEM_PICKUP tag) with
+// the resolved slot + phone timestamp + receive-side delta, then feed it to the
+// group spike detector (recordPickupAndDetectSpike) which decides whether the
+// group just spiked. The phone timestamp is logged for diagnostics only; spike
+// windowing uses the puck's receipt time (no shared cross-device clock).
+static uint32_t g_pickupLastRecvMS = 0;     // millis() of the previous pickup write
+static void onPickupWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
+                          uint8_t* data, uint16_t len) {
+  const uint32_t now = millis();
+  uint8_t r = len > 0 ? data[0] : 0;
+  uint8_t g = len > 1 ? data[1] : 0;
+  uint8_t b = len > 2 ? data[2] : 0;
+  uint64_t phoneMs = 0;
+  if (len >= 11) {
+    for (int i = 0; i < 8; i++) phoneMs |= (uint64_t)data[3 + i] << (8 * i);
+  }
+  // Pack the same way the strip/roster does so the compare matches u.color.
+  const uint32_t color = strip.Color(r, g, b);
+  User* u = findUserByColor(color);
+  const int slot = u ? (int)u->ID : -1;     // -1 = no current member with this color
+  const int32_t deltaMS = g_pickupLastRecvMS == 0 ? -1 : (int32_t)(now - g_pickupLastRecvMS);
+  Serial.print("MODEM_PICKUP recvMS="); Serial.print(now);
+  Serial.print(" conn=0x");             Serial.print(conn_handle, HEX);
+  Serial.print(" slot=");               Serial.print(slot);
+  Serial.print(" color=0x");            Serial.print(color, HEX);
+  Serial.print(" name=");               Serial.print(u ? u->name : "?");
+  Serial.print(" phoneMs=");            Serial.print((unsigned long)phoneMs);
+  Serial.print(" deltaMS=");            Serial.print(deltaMS);
+  Serial.print(" len=");                Serial.println(len);
+  g_pickupLastRecvMS = now;
+
+  // Count this pickup against its user and push the refreshed roster so every
+  // phone's pickups leaderboard updates live. Only attributed events (resolved to
+  // a current member) count — an unattributable color isn't a session user.
+  if (u) {
+    if (u->pickups < 0xFFFF) u->pickups++;
+    notifyRoster();
+  }
+
+  // Feed the group spike detector. Only attributed events (resolved to a current
+  // member) count toward the aggregate — an unattributable color can't be a
+  // distinct user. Windowing uses the puck's receipt time, not phoneMs.
+  if (slot >= 0) recordPickupAndDetectSpike((uint8_t)slot, now);
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -993,6 +1217,23 @@ void setup() {
   disconnChar.setMaxLen(1);
   disconnChar.setWriteCallback(onDisconnectRequest);
   disconnChar.begin();
+
+  // WRITE-only: production per-phone pickup (unlock) events. onPickupWrite
+  // attributes each event to a user by color and logs it for puck-side
+  // aggregation; the puck never reads it back.
+  pickupChar.setProperties(CHR_PROPS_WRITE | CHR_PROPS_WRITE_WO_RESP);
+  pickupChar.setPermission(SECMODE_NO_ACCESS, SECMODE_OPEN);
+  pickupChar.setMaxLen(16);
+  pickupChar.setWriteCallback(onPickupWrite);
+  pickupChar.begin();
+
+  // READ + NOTIFY: group pickup-spike trigger. The puck notifies here when the
+  // aggregate pickup rate spikes; phones observe it to surface a question.
+  spikeChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  spikeChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  spikeChar.setMaxLen(4);
+  spikeChar.begin();
+  { uint8_t z[4] = {0, 0, 0, 0}; spikeChar.write(z, sizeof(z)); }  // seed readable value
 
   // Standard Battery Service (0x180F): exposes the puck's 0..100% level for the
   // app's home-screen indicator. Begun after Bluefruit.begin(); seed it with an
