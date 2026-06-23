@@ -11,14 +11,15 @@
 /// Ported from modem_hw/modem_prototype, keeping its behavior but
 /// trading the Arduino-isms for an event-driven design:
 ///   - ArduinoBLE polling -> Bluefruit write callback (no BLE.poll()).
-/// Audio is being reworked for a speaker (not the prototype's buzzer);
-/// playSound() is a stub pending that hardware.
+/// Audio drives a speaker (not the prototype's buzzer) via an I2S MAX98357A amp;
+/// chime playback lives in modem_audio.* and is gated on the sound setting.
 
 #include <bluefruit.h>
 #include <Adafruit_NeoPixel.h>
 #include "modem_types.h"
 #include "ancs_client.h"
 #include "puck_settings.h"
+#include "modem_audio.h"
 
 /// Pins
 /// - - - - - - - - - - - -
@@ -79,6 +80,13 @@ static uint8_t const UUID_PICKUP[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,
 // slots involved. See detectPickupSpike / notifySpike. Aggregate only; the puck
 // never exposes a per-user pickup metric.
 static uint8_t const UUID_SPIKE[16]  = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0e,0x00,0x59,0xfb};
+// charging: USB/charge-state flag. Selector 0x0F — next free after spike (0x0E).
+// READ + NOTIFY, uint8 (0 = on battery, 1 = USB present / charging). The standard
+// Battery Service (0x180F) only carries a 0..100 percent, and while charging VDDH
+// is inflated so the puck SUPPRESSES the percent update — leaving the app to show
+// a stale/zero level. This flag lets the app render a charging icon instead. See
+// sampleBattery / isUsbPresent.
+static uint8_t const UUID_CHARGE[16] = {0xac,0xa3,0xa2,0x29,0x24,0xc0,0xf9,0xba,0xa6,0x4b,0x62,0xec,0x0f,0x00,0x59,0xfb};
 
 BLEService        modemSvc(UUID_SVC);
 BLECharacteristic ownerChar(UUID_OWNER);
@@ -121,6 +129,8 @@ BLECharacteristic brightChar(UUID_BRIGHT);
 BLECharacteristic pickupChar(UUID_PICKUP);
 // spike: group pickup-spike trigger (UUID_SPIKE). READ + NOTIFY. See notifySpike.
 BLECharacteristic spikeChar(UUID_SPIKE);
+// charging: USB/charge-state flag (UUID_CHARGE). READ + NOTIFY, uint8 0/1. See sampleBattery.
+BLECharacteristic chargeChar(UUID_CHARGE);
 
 // Cadence + bookkeeping for the once-a-minute session-time broadcast.
 constexpr uint32_t SESSION_NOTIFY_MS = 60000;  // push session time every minute
@@ -139,6 +149,7 @@ static uint32_t    g_lastSessMS      = 0;       // last session-time push
 BLEBas blebas;                                   // Bluefruit's Battery Service helper
 constexpr uint32_t BATTERY_SAMPLE_MS = 30000;    // re-measure + push every 30s
 static uint32_t    g_lastBatteryMS   = 0;
+static volatile bool g_forceBattery   = false;  // request an immediate re-sample (set on connect)
 static uint8_t     g_batteryPercent  = 0;
 
 // VDDHDIV5 conversion. With the internal 0.6V reference and gain 1/6
@@ -235,6 +246,11 @@ static void sampleBattery() {
   const float mv = readBatteryMv();
   g_usbPresent   = isUsbPresent();
 
+  // Publish the charge state so the app can show a charging icon (the suppressed
+  // percent below would otherwise read as a stale/zero level while plugged in).
+  chargeChar.write8(g_usbPresent ? 1 : 0);
+  chargeChar.notify8(g_usbPresent ? 1 : 0);
+
   // While charging/USB-powered VDDH is inflated by the charger, so skip the
   // percent update (keep the last battery-power level) instead of reporting a
   // misleadingly high state-of-charge.
@@ -298,10 +314,16 @@ constexpr uint32_t GAUGE_MS      = 600;   // user-count display duration
 State   CURR_STATE = State::Idle;
 Session g_session;
 
-// Live mirror of the persisted soundEnabled flag (puckSettings().soundEnabled),
-// kept here so the FX/audio path can gate playback without re-reading flash on
-// every effect. Seeded from flash in setup(), updated on a Sound write.
-static bool g_soundEnabled = true;
+// Audio chime requests. Raised from the BLE event task (startSession / addUser /
+// onColorWrite-reclaim / finalizeLeave / triggerNotifyLight) and consumed in
+// loop(), mirroring the visual-FX flag pattern (g_connectFx etc.) so I2S/DMA
+// playback is never kicked off from inside a GATT write callback. The sound gate
+// itself lives in the audio module (playChime reads puckSettings().soundEnabled).
+static volatile bool g_chimeStart  = false;   // first user joined -> session start
+static volatile bool g_chimeJoin   = false;   // a subsequent user joined
+static volatile bool g_chimeLeave  = false;   // a user left
+static volatile bool g_chimeNotify = false;   // allowlisted notification for a member
+static volatile bool g_claimFx     = false;   // puck claimed/taken over -> green pulse + claim chime
 
 /// Phone-requested disconnect queue
 /// - - - - - - - - - - - -
@@ -411,13 +433,9 @@ static void showSpin(uint32_t c, uint16_t head) {
   strip.show();
 }
 
-// TODO: speaker audio playback (to be implemented).
-// Hardware will drive a speaker rather than the prototype's buzzer; the
-// audio path (I2S / PWM / DAC + pin assignment) is still pending.
-static void playSound() {
-  if (!g_soundEnabled) return;   // honor the persisted Sound setting
-  // intentionally empty - to be implemented
-}
+// Speaker audio now lives in modem_audio.* (I2S/DMA chime playback for the
+// MAX98357A amp). Chimes are requested via the g_chime* flags and played in
+// loop(); the sound-enabled gate is enforced inside playChime().
 
 /// ANCS notify-light trigger
 /// - - - - - - - - - - - -
@@ -441,6 +459,7 @@ void triggerNotifyLight(uint8_t slotIndex) {
   // strip.show() never executes in callback context (this file's cardinal rule).
   g_notifyColor = colorOrFallback(u->color);
   g_notifyFx    = true;
+  g_chimeNotify = true;          // allowlisted notification for a member -> notify chime
 }
 
 /// Session / Users
@@ -513,6 +532,7 @@ static void startSession() {
   g_session.ID++;
   g_session.startTimeMS = millis();
   CURR_STATE = State::Active;
+  g_chimeStart = true;            // host: first user joined -> session-start chime
   Serial.print("session "); Serial.print(g_session.ID);
   Serial.println(" started -> Active");
 }
@@ -543,7 +563,8 @@ static User* addUser(uint16_t conn_handle) {
   if (c) c->getPeerName(u.name, sizeof(u.name));   // phone's name, if any
   g_session.userCount++;
 
-  if (firstUser) startSession();
+  if (firstUser) startSession();   // raises g_chimeStart (session-start chime)
+  else           g_chimeJoin = true;   // a subsequent member -> join chime
   return &u;
 }
 
@@ -600,6 +621,7 @@ static void finalizeLeave(uint16_t conn_handle) {
   if (!u) return;
   g_fxColor      = colorOrFallback(u->color);
   g_disconnectFx = true;
+  g_chimeLeave   = true;          // leave chime (endSession below may also fire if last out)
   removeUser(conn_handle);
   notifyUserCount();
   notifyRoster();
@@ -672,6 +694,11 @@ static void connectCallback(uint16_t conn_handle) {
   nameChar.notify(conn_handle, puckName, strlen(puckName));
 
   Serial.print("BLE connect: links="); Serial.println(Bluefruit.connected());
+
+  // Force a battery+charge re-sample on the next loop pass so the app's quick
+  // connect-and-read sees a current charge state (not one up to 30s stale).
+  // Flagged here; the ADC read itself runs in loop(), not callback context.
+  g_forceBattery = true;
 
   // Keep advertising while physical connection slots remain.
   if (Bluefruit.connected() < MAX_USERS)
@@ -766,6 +793,7 @@ static void onColorWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
     notifyRoster();              // resync any reader; the table itself is unchanged
     g_fxColor   = colorOrFallback(color);
     g_connectFx = true;
+    g_chimeJoin = true;          // reconnect within grace -> treat as a join chime
     return;
   }
 
@@ -828,7 +856,7 @@ static void onOwnerWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   puckSettingsSave();
 
   // Apply the freshly-reset state to the hardware + readable characteristics.
-  g_soundEnabled = s.soundEnabled;
+  // (The sound gate reads puckSettings().soundEnabled live, so nothing to mirror.)
   strip.setBrightness(s.brightness);
   ownerChar.write8(s.claimed);     // owned-flag now reads 1
   nameChar.write(s.name);
@@ -836,6 +864,9 @@ static void onOwnerWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   brightChar.write8(s.brightness);
   // Echo the (default) name back to the claiming phone so it reads defaults.
   nameChar.notify(conn_handle, s.name, strlen(s.name));
+  // Confirm the ownership change with a brief green pulse + claim chime. Deferred
+  // to loop() (this is a GATT write callback — no strip.show()/I2S here).
+  g_claimFx = true;
   Serial.println("owner write: claimed/took over -> settings reset to DEFAULTS");
 }
 
@@ -853,15 +884,15 @@ static void onNameWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   Serial.print("name write -> "); Serial.println(s.name);
 }
 
-// Sound write-callback: enable/disable interaction sound. Persisted + mirrored
-// to g_soundEnabled (which playSound honors) and the readable Sound value.
+// Sound write-callback: enable/disable interaction sound. Persisted to the
+// settings record (the live source of truth the chime gate reads in playChime)
+// and echoed to the readable Sound value. Takes effect on the very next chime.
 static void onSoundWrite(uint16_t /*conn_handle*/, BLECharacteristic* /*chr*/,
                          uint8_t* data, uint16_t len) {
   if (len < 1) return;
   PuckSettings& s = puckSettings();
   s.soundEnabled = data[0] ? 1 : 0;
   puckSettingsSave();
-  g_soundEnabled = s.soundEnabled;
   soundChar.write8(s.soundEnabled);
   Serial.print("sound write -> "); Serial.println(s.soundEnabled);
 }
@@ -1097,7 +1128,10 @@ void setup() {
   // blank/old board) BEFORE the lights so the strip comes up at the saved
   // brightness and the sound flag is in effect from the first interaction.
   puckSettingsBegin();
-  g_soundEnabled = puckSettings().soundEnabled;
+
+  // Speaker: init the I2S chime engine after settings (so the sound gate is
+  // readable). Safe even if init fails — chimes then no-op.
+  modemAudioBegin();
 
   // Lights: init first, then sit at the idle (cleared) color.
   strip.begin();
@@ -1235,6 +1269,14 @@ void setup() {
   spikeChar.begin();
   { uint8_t z[4] = {0, 0, 0, 0}; spikeChar.write(z, sizeof(z)); }  // seed readable value
 
+  // Charging flag: READ + NOTIFY uint8 (0/1). Seeded 0; sampleBattery keeps it
+  // current. Lets the app show a charging icon while the percent is suppressed.
+  chargeChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  chargeChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  chargeChar.setMaxLen(1);
+  chargeChar.begin();
+  chargeChar.write8(0);
+
   // Standard Battery Service (0x180F): exposes the puck's 0..100% level for the
   // app's home-screen indicator. Begun after Bluefruit.begin(); seed it with an
   // initial reading so a phone that connects/reads early gets a real value.
@@ -1313,8 +1355,11 @@ void loop() {
     }
   }
 
-  // Battery: re-measure periodically and push the fresh level to subscribers.
-  if ((int32_t)(now - g_lastBatteryMS) >= (int32_t)BATTERY_SAMPLE_MS) {
+  // Battery: re-measure periodically, or immediately when a connect requested it
+  // (so a freshly-connected app reads a current charge state), and push to subs.
+  if (g_forceBattery ||
+      (int32_t)(now - g_lastBatteryMS) >= (int32_t)BATTERY_SAMPLE_MS) {
+    g_forceBattery = false;
     g_lastBatteryMS = now;
     sampleBattery();
   }
@@ -1332,7 +1377,6 @@ void loop() {
     g_fxPhase  = FxPhase::Spin;
     g_fxStep   = 0;
     g_fxNextMS = now;                        // first spin frame now
-    playSound();
   }
 
   // A disconnect starts the leave FX: fade in fast -> flicker out -> gauge.
@@ -1355,9 +1399,31 @@ void loop() {
       g_fxStartMS = now;
       g_fxStep    = 0;                        // ramp index: even=up, odd=down
       g_fxNextMS  = now;
-      playSound();
     }
   }
+
+  // A claim/takeover confirms with a brief green pulse (reusing the notify Pulse
+  // ramp, forced green) plus the claim chime below. Claim is a deliberate, rare
+  // onboarding action, so it takes over any running FX rather than being dropped.
+  if (g_claimFx) {
+    g_claimFx   = false;
+    g_fxColor   = strip.Color(0, 150, 0);    // green
+    g_fxPhase   = FxPhase::Pulse;
+    g_fxStartMS = now;
+    g_fxStep    = 0;                          // ramp index: even=up, odd=down
+    g_fxNextMS  = now;
+    chimeClaim();
+  }
+
+  // Audio chimes: play the requested chime for each session event. Done here
+  // (not in the BLE callbacks that raise the flags) so I2S/DMA is never started
+  // from GATT-callback context, matching the deferred-FX rule above. The sound
+  // gate is enforced inside the wrappers (playChime). Distinct events are
+  // mutually exclusive per pass except notify, which can ride alongside a join.
+  if (g_chimeStart)  { g_chimeStart  = false; chimeStart();  }
+  if (g_chimeJoin)   { g_chimeJoin   = false; chimeJoin();   }
+  if (g_chimeLeave)  { g_chimeLeave  = false; chimeLeave();  }
+  if (g_chimeNotify) { g_chimeNotify = false; chimeNotify(); }
 
   // Advance whichever FX is running once its frame/phase timer elapses.
   if (g_fxPhase != FxPhase::Idle && (int32_t)(now - g_fxNextMS) >= 0) {
