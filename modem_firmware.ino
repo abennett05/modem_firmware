@@ -136,6 +136,14 @@ BLECharacteristic chargeChar(UUID_CHARGE);
 constexpr uint32_t SESSION_NOTIFY_MS = 60000;  // push session time every minute
 static uint32_t    g_lastSessMS      = 0;       // last session-time push
 
+// Roster is delivered as ONE notification per user (see notifyRoster). Sending
+// several notifications to the SAME connection back-to-back blocks on that link's
+// HVN TX semaphore (getHvnPacket), which would deadlock if done from a GATT write
+// callback (the task that frees the semaphore is the one we'd be blocking). So the
+// callbacks only RAISE this flag; loop() does the multi-packet send in task
+// context where blocking is safe. Coalesces multiple changes into one push.
+static volatile bool g_rosterDirty = false;
+
 /// Battery level (standard BLE Battery Service 0x180F / 0x2A19)
 /// - - - - - - - - - - - -
 /// The puck reports its battery as a 0..100% level over the standard Battery
@@ -498,6 +506,24 @@ static void notifySessionTime() {
 // The per-user uint16 carries this user's PICKUP count (phone unlocks) so each
 // phone can render the pickups leaderboard. The characteristic value is kept
 // current so a fresh reader sees the roster without waiting for the next change.
+//
+// PER-USER PACKET layout (one BLE notification per user, little-endian):
+//   [0] userCount   total members (lets the phone know how many to expect)
+//   [1] index       this user's 0-based position in the table
+//   [2] R [3] G [4] B
+//   [5] pickups lo  [6] pickups hi
+//   [7] nameLen     (capped to fit one notification)
+//   [8..] name
+// The phone collects packets by index until it has all `userCount` and then
+// renders the leaderboard. Each packet fits the 20-byte payload of a 23-byte MTU
+// (header 8 + up to 12 name bytes), so nothing is ever truncated — the reason we
+// page instead of sending one big roster (which doesn't fit, and a bigger MTU
+// overflows SoftDevice RAM). The readable characteristic value is kept as the full
+// UNPAGED table for a one-shot debug/blob read; live delivery is the packets.
+constexpr uint8_t ROSTER_PKT_HEADER = 8;   // count,index,R,G,B,pkLo,pkHi,nameLen
+
+// Update the readable roster value and request a paged push. Callable from GATT
+// write/CCCD callbacks: it never notifies here (that can block) — loop() does.
 static void notifyRoster() {
   uint8_t buf[1 + MAX_USERS * (3 + 2 + 1 + MAX_USER_NAME_LEN)];
   uint16_t n = 0;
@@ -514,9 +540,73 @@ static void notifyRoster() {
     memcpy(&buf[n], u.name, len);
     n += len;
   }
-  rosterChar.write(buf, n);
-  for (uint8_t i = 0; i < g_session.userCount; i++)
-    rosterChar.notify(g_session.connectedUsers[i].connHandle, buf, n);
+  rosterChar.write(buf, n);        // readable (unpaged) value for blob/debug reads
+  g_rosterDirty = true;            // loop() sends the per-user notifications
+}
+
+// Send the roster as one notification per user to every member. MUST run in task
+// context (loop()), never a callback: notifying the same connection repeatedly
+// blocks on its HVN TX semaphore until each packet transmits. Drains g_rosterDirty.
+static void pushRosterPaged() {
+  for (uint8_t m = 0; m < g_session.userCount; m++) {
+    const uint16_t conn = g_session.connectedUsers[m].connHandle;
+    BLEConnection* c = Bluefruit.Connection(conn);
+    const uint16_t usable = (c && c->getMtu() > 3) ? (uint16_t)(c->getMtu() - 3) : 20;
+    const uint8_t  maxName = usable > ROSTER_PKT_HEADER
+                               ? (uint8_t)(usable - ROSTER_PKT_HEADER) : 0;
+    for (uint8_t i = 0; i < g_session.userCount; i++) {
+      const User& u = g_session.connectedUsers[i];
+      uint8_t pkt[ROSTER_PKT_HEADER + MAX_USER_NAME_LEN];
+      uint16_t n = 0;
+      pkt[n++] = g_session.userCount;
+      pkt[n++] = i;
+      pkt[n++] = (uint8_t)((u.color >> 16) & 0xFF);
+      pkt[n++] = (uint8_t)((u.color >>  8) & 0xFF);
+      pkt[n++] = (uint8_t)( u.color        & 0xFF);
+      pkt[n++] = (uint8_t)( u.pickups        & 0xFF);
+      pkt[n++] = (uint8_t)((u.pickups >>  8) & 0xFF);
+      uint8_t len = (uint8_t)strnlen(u.name, MAX_USER_NAME_LEN);
+      if (len > maxName) len = maxName;          // keep the packet within one MTU
+      pkt[n++] = len;
+      memcpy(&pkt[n], u.name, len);
+      n += len;
+      rosterChar.notify(conn, pkt, n);
+    }
+  }
+}
+
+// CCCD-subscribe backstop for the join-time race. On the nRF52 the SoftDevice
+// auto-serves characteristic READS from the stored value immediately, but the
+// color write's callback (onColorWrite -> joinUser, which sets the count and fills
+// the roster) is dispatched LATER from Bluefruit's event task. So a phone that
+// writes its color and then reads count/roster during connect can be served the
+// STALE pre-join values, and the join-time notify is dropped because the phone
+// hasn't finished subscribing yet — leaving "0/8" and an empty leaderboard.
+//
+// Fix: when a phone ENABLES notifications (writes CCCD=1) on a state
+// characteristic, push that characteristic's CURRENT value to it right then. The
+// CCCD write is processed AFTER the earlier color write on the same Bluefruit
+// event task, so the join is already applied AND the phone is, by definition, now
+// subscribed — no timing guess. Replaces the old g_rosterRepushMS delay, which
+// fired too early (timed from the join, not from the later roster subscribe).
+static void onCountSubscribe(uint16_t conn_handle, BLECharacteristic*, uint16_t value) {
+  if (!(value & 0x0001)) return;                 // only on enable-notify
+  const uint8_t n = g_session.userCount;
+  countChar.notify(conn_handle, &n, 1);
+}
+static void onSessionSubscribe(uint16_t conn_handle, BLECharacteristic*, uint16_t value) {
+  if (!(value & 0x0001)) return;
+  uint16_t secs = 0;
+  if (CURR_STATE == State::Active && g_session.startTimeMS) {
+    uint32_t elapsed = (millis() - g_session.startTimeMS) / 1000;
+    secs = elapsed > 0xFFFF ? 0xFFFF : (uint16_t)elapsed;
+  }
+  sessChar.notify16(conn_handle, secs);
+}
+static void onRosterSubscribe(uint16_t conn_handle, BLECharacteristic*, uint16_t value) {
+  if (!(value & 0x0001)) return;
+  // Re-push the full table; the just-subscribed phone now receives current state.
+  notifyRoster();
 }
 
 // Find the User that owns a connection (nullptr if none).
@@ -593,6 +683,10 @@ static User* joinUser(uint16_t conn_handle) {
   notifyRoster();
   notifySessionTime();
   g_lastSessMS = millis();
+  // NOTE: the join-time count/roster/session pushes above can race the joining
+  // phone's own subscribe (it may not have written CCCD=1 yet). The CCCD-write
+  // callbacks (onCountSubscribe / onRosterSubscribe / onSessionSubscribe) re-push
+  // current state the instant that phone subscribes, which is the reliable fix.
 
   Serial.print("join: users="); Serial.println(g_session.userCount);
   return u;
@@ -660,8 +754,10 @@ static void dumpState() {
   Serial.print(" users="); Serial.println(g_session.userCount);
   for (uint8_t i = 0; i < g_session.userCount; i++) {
     const User& u = g_session.connectedUsers[i];
+    BLEConnection* c = Bluefruit.Connection(u.connHandle);
     Serial.print("  user["); Serial.print(i); Serial.print("] conn=0x");
     Serial.print(u.connHandle, HEX);
+    Serial.print(" mtu="); Serial.print(c ? c->getMtu() : 0);
     Serial.print(" color=0x"); Serial.print(u.color, HEX);
     Serial.print(" stime="); Serial.print(u.screenTime);
     Serial.print(" pickups="); Serial.print(u.pickups);
@@ -693,15 +789,25 @@ static void connectCallback(uint16_t conn_handle) {
   const char* puckName = puckSettings().name;
   nameChar.notify(conn_handle, puckName, strlen(puckName));
 
-  Serial.print("BLE connect: links="); Serial.println(Bluefruit.connected());
+  // Log the link count and this link's MTU. The MTU exchange may not have
+  // completed yet at connect time, so this is the lower bound; the heartbeat
+  // (dumpState) logs the settled per-user MTU for verifying the roster fix.
+  BLEConnection* c = Bluefruit.Connection(conn_handle);
+  Serial.print("BLE connect: links="); Serial.print(Bluefruit.connected());
+  Serial.print(" mtu="); Serial.println(c ? c->getMtu() : 0);
 
   // Force a battery+charge re-sample on the next loop pass so the app's quick
   // connect-and-read sees a current charge state (not one up to 30s stale).
   // Flagged here; the ADC read itself runs in loop(), not callback context.
   g_forceBattery = true;
 
-  // Keep advertising while physical connection slots remain.
-  if (Bluefruit.connected() < MAX_USERS)
+  // Keep advertising while SESSION-MEMBER slots remain — gate on userCount, NOT
+  // the raw physical link count. iOS background/phantom links inflate
+  // Bluefruit.connected() without being session members; gating on links stopped
+  // advertising early and hid the puck from later phones while seats were still
+  // open. (Bounded by the physical ceiling regardless: begin(MAX_USERS) is what
+  // ultimately refuses a connection once all physical links are in use.)
+  if (g_session.userCount < MAX_USERS)
     Bluefruit.Advertising.start(0);
 }
 
@@ -771,6 +877,55 @@ static void onUserNameWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   notifyRoster();
 }
 
+// Canonical color palette, mirroring the Flutter app's kPalette (lib/settings.dart)
+// in palette order. Stored as 0x00RRGGBB to match strip.Color() / User.color. The
+// app already prevents two phones from picking the same color (it greys out taken
+// swatches and runs its own collision modal), so this table exists as a FIRMWARE
+// BACKSTOP: it makes the "colors are unique per session" invariant that
+// reclaimPendingLeave / findUserByColor depend on true in code, covering the race
+// where two phones commit the same color before the roster propagates.
+//   FUTURE: identity should key on a stable per-user ID (User.ID already exists)
+//   echoed by the app, retiring color-as-identity entirely. Out of scope here.
+static const uint32_t COLOR_PALETTE[MAX_USERS] = {
+  0xEC7D3E,  // Coral
+  0x6F86F2,  // Indigo
+  0xF4E07A,  // Lemon
+  0x74E36B,  // Lime
+  0xE070E0,  // Orchid
+  0xFF4D4D,  // Crimson
+  0x4FC3F7,  // Sky
+  0x9B6BF0,  // Violet
+};
+
+// True if any CURRENT member other than `exceptHandle` already owns `color`.
+static bool colorTakenByOther(uint32_t color, uint16_t exceptHandle) {
+  for (uint8_t i = 0; i < g_session.userCount; i++) {
+    const User& u = g_session.connectedUsers[i];
+    if (u.connHandle != exceptHandle && u.color == color) return true;
+  }
+  return false;
+}
+
+// Resolve a requested color to a unique one. If no other member holds it, the
+// request stands. On a collision, nudge to the first FREE palette entry so the
+// uniqueness invariant holds; if the whole palette is somehow occupied (a full
+// 8-user session), keep the request unchanged (joinUser will reject the write
+// anyway when the session is full).
+static uint32_t resolveUniqueColor(uint32_t requested, uint16_t conn_handle) {
+  if (!colorTakenByOther(requested, conn_handle)) return requested;
+  for (uint8_t i = 0; i < MAX_USERS; i++) {
+    if (!colorTakenByOther(COLOR_PALETTE[i], conn_handle)) {
+      Serial.print("color collision 0x"); Serial.print(requested, HEX);
+      Serial.print(" -> nudged to palette[0x"); Serial.print(COLOR_PALETTE[i], HEX);
+      Serial.println("]");
+      return COLOR_PALETTE[i];
+    }
+  }
+  Serial.print("color collision 0x"); Serial.print(requested, HEX);
+  Serial.println(" but palette full -> kept");
+  return requested;
+}
+
 // Bluefruit write-callback signature.
 static void onColorWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
                          uint8_t* data, uint16_t len) {
@@ -801,6 +956,10 @@ static void onColorWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   // A phantom ANCS reconnect never sends a color, so it never joins or animates.
   User* u = joinUser(conn_handle);
   if (!u) return;                  // session full — ignore the write
+  // Enforce per-session color uniqueness so reclaimPendingLeave / findUserByColor
+  // (which key identity on color) can never alias two members (backstop; the app
+  // already prevents collisions). On a clash this nudges to a free palette color.
+  color    = resolveUniqueColor(color, conn_handle);
   u->color = color;
 
   // Color shows in each leaderboard row — refresh every phone's roster.
@@ -1145,8 +1304,30 @@ void setup() {
   // buffers) always registers — an overflow here silently drops characteristics.
   // Must be configured BEFORE Bluefruit.begin().
   Bluefruit.configAttrTableSize(0x1000);
-  // Allow up to MAX_USERS concurrent peripheral connections.
-  Bluefruit.begin(MAX_USERS);
+  // ATT MTU stays at the core default (23). The SoftDevice RAM reservation (24 KB,
+  // app RAM ORIGIN 0x20006000 in nrf52840_s140_v6.ld) is nearly full at 8 links +
+  // this attr table, so ANY MTU bump (tried 247, then 128) overflows it,
+  // sd_ble_enable() returns NO_MEM, begin() fails, and the puck goes unconnectable.
+  // Instead of a bigger MTU, the roster is sent ONE USER PER NOTIFICATION (each
+  // packet fits the 20-byte payload of a 23-byte MTU) and reassembled on the
+  // phone — see notifyRoster / pushRosterPaged. No configPrphConn here on purpose.
+  // Allow up to MAX_USERS concurrent peripheral connections. NOTE: this is the
+  // PHYSICAL link ceiling; on iOS a single phone can hold a second (background
+  // pickup / phantom ANCS) link, so this 8 can be consumed by fewer than 8
+  // session members. Raising it to give each phone two links is deferred: it
+  // also requires resizing the ANCS slot pool (ancs_client g_slots[MAX_USERS],
+  // allocated per-connection) and re-validating SoftDevice RAM on hardware. The
+  // links-vs-users heartbeat below is the instrument to confirm whether that
+  // ceiling is actually being hit in the field before taking that change.
+  // Check the return: begin() fails (returns false) if the SoftDevice config
+  // (notably the MTU above) needs more RAM than the linker reserved. Make that
+  // LOUD — a silent failure here leaves BLE down and the puck unconnectable, which
+  // is hard to tell apart from a hardware fault. If this ever fires, lower the MTU
+  // in configPrphConn above.
+  if (!Bluefruit.begin(MAX_USERS)) {
+    Serial.println("MODEM_FATAL Bluefruit.begin() FAILED — SoftDevice RAM/config "
+                   "overflow. BLE is DOWN. Lower the configPrphConn MTU.");
+  }
   Bluefruit.setTxPower(4);
   Bluefruit.setName(DEVICE_NAME);
   Bluefruit.Periph.setConnectCallback(connectCallback);
@@ -1200,6 +1381,8 @@ void setup() {
   countChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
   countChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
   countChar.setMaxLen(1);
+  // Push the current count the instant a phone subscribes (join-time race fix).
+  countChar.setCccdWriteCallback(onCountSubscribe);
   countChar.begin();
   countChar.write8(g_session.userCount);
 
@@ -1223,6 +1406,8 @@ void setup() {
   sessChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
   sessChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
   sessChar.setMaxLen(2);
+  // Push the current session clock the instant a phone subscribes.
+  sessChar.setCccdWriteCallback(onSessionSubscribe);
   sessChar.begin();
   sessChar.write16(0);
 
@@ -1231,6 +1416,10 @@ void setup() {
   rosterChar.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
   rosterChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
   rosterChar.setMaxLen(1 + MAX_USERS * (3 + 2 + 1 + MAX_USER_NAME_LEN));
+  // Push the full roster the instant a phone subscribes (fixes the empty
+  // leaderboard: the connect-time read races the join and is served the empty
+  // table, and the join-time notify lands before the phone has subscribed).
+  rosterChar.setCccdWriteCallback(onRosterSubscribe);
   rosterChar.begin();
   { const uint8_t empty = 0; rosterChar.write(&empty, 1); }
 
@@ -1329,6 +1518,14 @@ void loop() {
     ancsUnsubscribe(h);                      // (B) stop consuming ANCS, keep bond
     Bluefruit.disconnect(h);
     Serial.print("disconnect issued conn=0x"); Serial.println(h, HEX);
+  }
+
+  // Roster: send the per-user packets here (task context) when a change raised the
+  // dirty flag. Done in loop() — not the callbacks that set it — because notifying
+  // one connection repeatedly blocks on its HVN TX semaphore until each transmits.
+  if (g_rosterDirty) {
+    g_rosterDirty = false;
+    pushRosterPaged();
   }
 
   // The puck owns the session clock: push it to every phone once a minute so
