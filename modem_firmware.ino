@@ -20,6 +20,93 @@
 #include "ancs_client.h"
 #include "puck_settings.h"
 #include "modem_audio.h"
+#include <malloc.h>
+
+/// Brick-on-disconnect instrumentation (additive — see BRICK_ON_DISCONNECT_REPORT.md)
+/// - - - - - - - - - - - -
+/// Probes that leave a trail in the serial log showing whether HEAP (H1: the
+/// auto-doubling Ada-callback queue ratcheting the shared newlib heap) or the
+/// 3 KB Callback-task STACK (H2) is the resource that fails on a disconnect that
+/// coincides with a flash write. No behavior change. All output uses grep-able
+/// prefixes: [HEAP] [STACK] [EVT] [SDERR].
+extern "C" {
+  extern unsigned char __HeapBase[];   // linker symbols: bounds of the C heap
+  extern unsigned char __HeapLimit[];
+}
+
+// Bytes still allocatable from the C heap — the SINGLE newlib sbrk heap that backs
+// both rtos_malloc and the per-callback Ada-callback queue. Derived as the linker
+// heap span minus bytes currently in use, so HELD allocations (H1's queue growth)
+// make this ratchet DOWN and never recover across connect/disconnect cycles.
+// (The report's util_heap_get_free_size() exists only inside a CFG_DEBUG>=3
+// PRINT_HEAP macro and is not linkable here, so we read mallinfo() instead.)
+static uint32_t heapFreeBytes() {
+  struct mallinfo mi = mallinfo();
+  uint32_t span = (uint32_t)((unsigned char*)__HeapLimit - (unsigned char*)__HeapBase);
+  return span - (uint32_t)mi.uordblks;
+}
+
+// Task handles for the per-task stack high-water probe, resolved ONCE by name.
+// xTaskGetHandle() is compiled out in this core (INCLUDE_xTaskGetHandle defaults
+// to 0; the vendored FreeRTOSConfig does not enable it, and enabling it would be a
+// core edit — out of scope). configUSE_TRACE_FACILITY=1 IS set, so
+// uxTaskGetSystemState() is the no-core-edit way to map a task name -> handle.
+static TaskHandle_t g_hCallback = nullptr;
+static TaskHandle_t g_hBLE      = nullptr;
+static TaskHandle_t g_hLoop     = nullptr;
+static void cacheTaskHandles() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  TaskStatus_t st[16];
+  UBaseType_t n = uxTaskGetNumberOfTasks();
+  const UBaseType_t cap = (UBaseType_t)(sizeof(st) / sizeof(st[0]));
+  if (n > cap) n = cap;
+  const UBaseType_t got = uxTaskGetSystemState(st, n, nullptr);
+  for (UBaseType_t i = 0; i < got; i++) {
+    if      (!strcmp(st[i].pcTaskName, "Callback")) g_hCallback = st[i].xHandle;
+    else if (!strcmp(st[i].pcTaskName, "BLE"))      g_hBLE      = st[i].xHandle;
+    else if (!strcmp(st[i].pcTaskName, "loop"))     g_hLoop     = st[i].xHandle;
+  }
+}
+// Words of stack a task has NEVER dropped below (closer to 0 = closer to overflow).
+static uint32_t stackFreeWords(TaskHandle_t h) {
+  return h ? (uint32_t)uxTaskGetStackHighWaterMark(h) : 0;
+}
+
+// Event-rate counters (H4 burst-rate context; the burst is what feeds H1/H2).
+// Incremented on the Callback task, snapshot+reset on the loop task each heartbeat
+// (a count racing the reset is acceptable for a diagnostic). "secured" events are
+// intentionally NOT counted: that callback lives in ancs_client.cpp (ANCS
+// architecture, out of scope this pass).
+static volatile uint32_t g_evtConnect         = 0;
+static volatile uint32_t g_evtDiscIntentional = 0;
+static volatile uint32_t g_evtDiscSpontaneous = 0;
+
+// Emit the [HEAP] + [STACKCB] lines at a connect/disconnect edge. Every call site
+// is ON the Callback task, so uxTaskGetStackHighWaterMark(NULL) reads THAT task's
+// cumulative low-water — the H2 confirmation. H1 was ruled out (heap stays flat at
+// ~192 KB); the live hypothesis is the 3 KB Callback stack overflowing during the
+// core's stack-hungry bond-flash write (bond_save_cccd), which a disconnect itself
+// queues onto this task. Read at the churn edges (not just the 5 s heartbeat)
+// because the fatal drop can happen between heartbeats. cb_words_free trending
+// toward 0 across disconnect/connect events == H2 confirmed.
+static void logHeapEvent(const char* ev, uint16_t handle) {
+  Serial.print("[HEAP] free="); Serial.print(heapFreeBytes());
+  Serial.print(" ev="); Serial.print(ev);
+  Serial.print(" handle="); Serial.println(handle);
+  Serial.print("[STACKCB] cb_words_free=");
+  Serial.print((uint32_t)uxTaskGetStackHighWaterMark(nullptr));
+  Serial.print(" ev="); Serial.println(ev);
+}
+
+/// BUILD-FLAG TOGGLE (documented, NOT enabled by default).
+/// Building with -DCFG_DEBUG=1 turns the FreeRTOS hooks
+/// vApplicationStackOverflowHook / vApplicationMallocFailedHook
+/// (CORE/rtos.cpp) from `while(CFG_DEBUG) yield();` into a SPIN-IN-PLACE, so a
+/// stack overflow or failed malloc HALTS with the failing task name reachable to a
+/// debugger instead of returning into corruption -> blind HardFault. Use only for
+/// a repro session; the shipped build stays at CFG_DEBUG=0 (platform.txt).
 
 /// Pins
 /// - - - - - - - - - - - -
@@ -143,6 +230,16 @@ static uint32_t    g_lastSessMS      = 0;       // last session-time push
 // callbacks only RAISE this flag; loop() does the multi-packet send in task
 // context where blocking is safe. Coalesces multiple changes into one push.
 static volatile bool g_rosterDirty = false;
+
+// Settings-persistence dirty flag (brick-on-disconnect R1). The owner/name/sound/
+// brightness GATT write callbacks mutate puckSettings() in RAM and RAISE this; the
+// actual LittleFS write (puckSettingsSave) runs in loop(), NOT on the 3 KB Callback
+// task that connect/disconnect/bond-save also share. Multiple writes between two
+// loop passes COALESCE into one save (natural debounce — no timer). Trade: a
+// settings change followed by power loss before the next loop() tick is not
+// persisted. Acceptable for owner/name/sound/brightness; revisit if any future
+// write site is critical-path persistence.
+static volatile bool g_settingsDirty = false;
 
 /// Battery level (standard BLE Battery Service 0x180F / 0x2A19)
 /// - - - - - - - - - - - -
@@ -482,8 +579,14 @@ void triggerNotifyLight(uint8_t slotIndex) {
 static void notifyUserCount() {
   const uint8_t n = g_session.userCount;
   countChar.write8(n);
-  for (uint8_t i = 0; i < g_session.userCount; i++)
-    countChar.notify(g_session.connectedUsers[i].connHandle, &n, 1);
+  for (uint8_t i = 0; i < g_session.userCount; i++) {
+    // R5: surface a swallowed HVN failure (e.g. NO_MEM / NO_TX_PACKETS under
+    // SoftDevice RAM pressure). Log only — no retry, no control-flow change.
+    if (!countChar.notify(g_session.connectedUsers[i].connHandle, &n, 1)) {
+      Serial.print("[SDERR] notifyUserCount notify failed conn=0x");
+      Serial.println(g_session.connectedUsers[i].connHandle, HEX);
+    }
+  }
 }
 
 // Push the canonical session time (seconds since the first user joined) to
@@ -570,7 +673,13 @@ static void pushRosterPaged() {
       pkt[n++] = len;
       memcpy(&pkt[n], u.name, len);
       n += len;
-      rosterChar.notify(conn, pkt, n);
+      // R5: the roster HVN path is reached on the disconnect trail
+      // (finalizeLeave -> notifyRoster -> g_rosterDirty -> here), so surface a
+      // swallowed NO_MEM / NO_TX_PACKETS instead of dropping it silently.
+      if (!rosterChar.notify(conn, pkt, n)) {
+        Serial.print("[SDERR] pushRosterPaged notify failed conn=0x");
+        Serial.print(conn, HEX); Serial.print(" idx="); Serial.println(i);
+      }
     }
   }
 }
@@ -732,7 +841,9 @@ static void finalizeLeave(uint16_t conn_handle) {
 static User* reclaimPendingLeave(uint16_t newHandle, uint32_t color) {
   for (uint8_t i = 0; i < g_session.userCount; i++) {
     User& u = g_session.connectedUsers[i];
-    if (u.pendingLeaveMS != 0 && u.color == color) {
+    // An intentional (app-requested) leave always finalizes and is never reclaimed,
+    // even in the brief window before loop() finalizes it (R4).
+    if (u.pendingLeaveMS != 0 && !u.intentionalLeave && u.color == color) {
       Serial.print("reclaim: conn 0x"); Serial.print(u.connHandle, HEX);
       Serial.print(" -> 0x"); Serial.println(newHandle, HEX);
       u.connHandle     = newHandle;
@@ -747,6 +858,31 @@ static User* reclaimPendingLeave(uint16_t newHandle, uint32_t color) {
 // live link count, and each member's color / screen time / grace status,
 // followed by the per-slot ANCS state. Read-only — safe to call from loop().
 static void dumpState() {
+  // --- Brick-on-disconnect probes (see BRICK_ON_DISCONNECT_REPORT.md) ---
+  // [HEAP] should stay FLAT across many connect/disconnect cycles (a downward
+  // ratchet that never recovers = H1). [STACK] cb= should NOT trend toward 0 on a
+  // disconnect that coincides with a settings/bond flash write (= H2).
+  cacheTaskHandles();
+  Serial.print("[HEAP] free="); Serial.print(heapFreeBytes());
+  Serial.println(" ev=heartbeat handle=-1");
+  // "na" = handle never resolved (probe broken), distinct from a real low value.
+  Serial.print("[STACK] cb=");
+  if (g_hCallback) Serial.print(stackFreeWords(g_hCallback)); else Serial.print("na");
+  Serial.print(" ble=");
+  if (g_hBLE) Serial.print(stackFreeWords(g_hBLE)); else Serial.print("na");
+  Serial.print(" loop=");
+  if (g_hLoop) Serial.print(stackFreeWords(g_hLoop)); else Serial.print("na");
+  Serial.println(" (words free; lower=closer to overflow)");
+  {
+    const uint32_t c  = g_evtConnect;
+    const uint32_t di = g_evtDiscIntentional;
+    const uint32_t ds = g_evtDiscSpontaneous;
+    g_evtConnect = 0; g_evtDiscIntentional = 0; g_evtDiscSpontaneous = 0;
+    Serial.print("[EVT] connect="); Serial.print(c);
+    Serial.print(" disc_int="); Serial.print(di);
+    Serial.print(" disc_spont="); Serial.println(ds);
+  }
+
   Serial.print("MODEM_state t="); Serial.print(millis());
   Serial.print(" state=");
   Serial.print(CURR_STATE == State::Active ? "Active" : "Idle");
@@ -778,6 +914,8 @@ static void dumpState() {
 // makes a system ANCS reconnect — which has no app behind it and never writes an
 // identity — invisible to the session instead of a "phantom user".
 static void connectCallback(uint16_t conn_handle) {
+  logHeapEvent("connect", conn_handle);     // [HEAP] at the connect edge (H1)
+  g_evtConnect++;
   // Start this slot's per-connection ANCS client (requests bonding; discovery +
   // subscribe happen once the link is secured). ancs_client keys by conn_handle
   // and owns its own slot; userHint is log-only and unknown until a join, so 0xFF.
@@ -807,12 +945,15 @@ static void connectCallback(uint16_t conn_handle) {
   // advertising early and hid the puck from later phones while seats were still
   // open. (Bounded by the physical ceiling regardless: begin(MAX_USERS) is what
   // ultimately refuses a connection once all physical links are in use.)
-  if (g_session.userCount < MAX_USERS)
-    Bluefruit.Advertising.start(0);
+  if (g_session.userCount < MAX_USERS) {
+    if (!Bluefruit.Advertising.start(0))   // R5: surface a swallowed advertise failure
+      Serial.println("[SDERR] Advertising.start failed (connectCallback)");
+  }
 }
 
 // Called whenever a central disconnects.
 static void disconnectCallback(uint16_t conn_handle, uint8_t reason) {
+  logHeapEvent("disconnect", conn_handle);   // [HEAP] at the disconnect edge (H1)
   // Tear down this slot's ANCS client first (halt fetches, drop allowlist,
   // reset buffers). Always runs — even for a connection that never joined the
   // session (e.g. a phantom ANCS reconnect). Idempotent + matches the exact
@@ -825,25 +966,36 @@ static void disconnectCallback(uint16_t conn_handle, uint8_t reason) {
   User* u = findUser(conn_handle);
   if (!u) {
     Serial.print("BLE disconnect (non-member): links="); Serial.println(Bluefruit.connected());
+    logHeapEvent("disconnect-exit", conn_handle);
     return;
   }
 
   if (takeIntentionalLeave(conn_handle)) {
-    // The app explicitly asked to leave (fb59000B) — finalize now, no grace.
-    Serial.print("BLE disconnect (intentional) conn=0x"); Serial.println(conn_handle, HEX);
-    finalizeLeave(conn_handle);
+    // The app explicitly asked to leave (fb59000B). DEFER the finalize to loop()
+    // exactly like the spontaneous path: finalizeLeave runs notifyRoster (241 B
+    // stack buffer) + SoftDevice writes, which must NOT execute on the 3 KB
+    // Callback task (brick-on-disconnect R4). Mark the leave intentional so the
+    // loop() grace sweep finalizes it on the NEXT pass — no LEAVE_GRACE_MS wait.
+    if (u->pendingLeaveMS == 0) u->pendingLeaveMS = millis();
+    u->intentionalLeave = true;
+    g_evtDiscIntentional++;
+    Serial.print("BLE disconnect (intentional) conn=0x"); Serial.print(conn_handle, HEX);
+    Serial.println(" -> finalizing in loop()");
   } else {
     // Spontaneous drop (iOS churn / brief out-of-range). Hold the member through
     // the grace window: leave the roster untouched so the OTHER phones don't see
     // them blink out, and let a fast reconnect + color re-write reclaim the slot
     // (reclaimPendingLeave). loop() finalizes the leave only if grace expires.
     if (u->pendingLeaveMS == 0) u->pendingLeaveMS = millis();
+    u->intentionalLeave = false;
+    g_evtDiscSpontaneous++;
     Serial.print("BLE disconnect (spontaneous) conn=0x"); Serial.print(conn_handle, HEX);
     Serial.print(" reason=0x"); Serial.print(reason, HEX);
     Serial.print(" -> holding "); Serial.print(LEAVE_GRACE_MS);
     Serial.println("ms for grace");
   }
   // restartOnDisconnect(true) re-advertises automatically.
+  logHeapEvent("disconnect-exit", conn_handle);   // [HEAP] at disconnect exit (H1)
 }
 
 // Bluefruit write-callback for the screen-time characteristic. Each phone
@@ -1012,7 +1164,7 @@ static void onOwnerWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   memcpy(s.ownerKey, data, PUCK_OWNER_KEY_LEN);
   s.claimed = 1;
   puckSettingsResetToDefaults();
-  puckSettingsSave();
+  g_settingsDirty = true;          // R1: flash write deferred to loop()
 
   // Apply the freshly-reset state to the hardware + readable characteristics.
   // (The sound gate reads puckSettings().soundEnabled live, so nothing to mirror.)
@@ -1037,7 +1189,7 @@ static void onNameWrite(uint16_t conn_handle, BLECharacteristic* /*chr*/,
   uint16_t n = len < MAX_DEVICE_NAME_LEN - 1 ? len : MAX_DEVICE_NAME_LEN - 1;
   memcpy(s.name, data, n);
   s.name[n] = '\0';
-  puckSettingsSave();
+  g_settingsDirty = true;          // R1: flash write deferred to loop()
   nameChar.write(s.name);
   nameChar.notify(conn_handle, s.name, strlen(s.name));
   Serial.print("name write -> "); Serial.println(s.name);
@@ -1051,7 +1203,7 @@ static void onSoundWrite(uint16_t /*conn_handle*/, BLECharacteristic* /*chr*/,
   if (len < 1) return;
   PuckSettings& s = puckSettings();
   s.soundEnabled = data[0] ? 1 : 0;
-  puckSettingsSave();
+  g_settingsDirty = true;          // R1: flash write deferred to loop()
   soundChar.write8(s.soundEnabled);
   Serial.print("sound write -> "); Serial.println(s.soundEnabled);
 }
@@ -1066,7 +1218,7 @@ static void onBrightnessWrite(uint16_t /*conn_handle*/, BLECharacteristic* /*chr
   PuckSettings& s = puckSettings();
   uint8_t b = data[0] > LIGHT_BRIGHTNESS_MAX ? LIGHT_BRIGHTNESS_MAX : data[0];
   s.brightness = b;
-  puckSettingsSave();
+  g_settingsDirty = true;          // R1: flash write deferred to loop()
   strip.setBrightness(b);
   strip.show();
   brightChar.write8(s.brightness);
@@ -1485,7 +1637,8 @@ void setup() {
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.setInterval(32, 244);  // 20 ms .. 152.5 ms
   Bluefruit.Advertising.setFastTimeout(30);
-  Bluefruit.Advertising.start(0);              // 0 = advertise forever
+  if (!Bluefruit.Advertising.start(0))         // 0 = advertise forever (R5: log a failure)
+    Serial.println("[SDERR] Advertising.start failed (setup)");
 
   // Start Idle with an empty session; the first connection creates one.
   g_session  = Session{};
@@ -1528,6 +1681,16 @@ void loop() {
     pushRosterPaged();
   }
 
+  // Settings persistence (brick-on-disconnect R1): the GATT write callbacks mutate
+  // puckSettings() in RAM and raise g_settingsDirty; the LittleFS write runs HERE
+  // in task context so flash never touches the 3 KB Callback task. Clear the flag
+  // BEFORE the save so a write that arrives during the save re-flags and is not
+  // lost. Rapid writes between two loop passes naturally coalesce into one save.
+  if (g_settingsDirty) {
+    g_settingsDirty = false;
+    puckSettingsSave();
+  }
+
   // The puck owns the session clock: push it to every phone once a minute so
   // all devices stay in sync. (A baseline is also pushed on each join.)
   if (CURR_STATE == State::Active &&
@@ -1536,15 +1699,19 @@ void loop() {
     notifySessionTime();
   }
 
-  // Leave-grace sweep: finalize any spontaneously-dropped member whose grace
-  // window expired with no reconnect. One per pass — finalizeLeave repacks the
-  // user array, so the rest are re-checked on the next loop.
+  // Leave finalize sweep: finalize either (a) an APP-REQUESTED ("intentional")
+  // leave immediately — R4 moved finalizeLeave (notifyRoster's 241 B buffer + SD
+  // writes) off the 3 KB Callback task to here — or (b) a spontaneously-dropped
+  // member whose grace window expired with no reconnect. One per pass —
+  // finalizeLeave repacks the user array, so the rest are re-checked next loop.
   if (CURR_STATE == State::Active) {
     for (uint8_t i = 0; i < g_session.userCount; i++) {
       const User& u = g_session.connectedUsers[i];
       if (u.pendingLeaveMS != 0 &&
-          (int32_t)(now - u.pendingLeaveMS) >= (int32_t)LEAVE_GRACE_MS) {
-        Serial.print("leave grace expired conn=0x");
+          (u.intentionalLeave ||
+           (int32_t)(now - u.pendingLeaveMS) >= (int32_t)LEAVE_GRACE_MS)) {
+        Serial.print(u.intentionalLeave ? "intentional leave finalizing conn=0x"
+                                        : "leave grace expired conn=0x");
         Serial.println(u.connHandle, HEX);
         finalizeLeave(u.connHandle);
         break;

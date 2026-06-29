@@ -71,6 +71,13 @@ struct User {
   // app rejoin can reclaim the slot (see reclaimPendingLeave) without flickering
   // off everyone else's leaderboard. loop() finalizes the leave if it expires.
   uint32_t pendingLeaveMS;
+  // True when this pending leave was an APP-REQUESTED ("intentional") leave rather
+  // than a spontaneous drop. Set alongside pendingLeaveMS in disconnectCallback's
+  // intentional branch; the loop() grace sweep finalizes an intentional leave on
+  // the next pass (no LEAVE_GRACE_MS wait) and reclaimPendingLeave never re-adopts
+  // one. This is what lets finalizeLeave run from loop() instead of on the 3 KB
+  // Callback task (the brick-on-disconnect fix). Zero-init (false) on join.
+  bool intentionalLeave;
 };
 
 /// Session
