@@ -379,6 +379,11 @@ static void sampleBattery() {
 // log can pin down, so this stays on; it's a few cheap prints every few seconds.
 constexpr uint32_t HEARTBEAT_MS = 5000;
 
+// Watchdog timeout (seconds). If loop() fails to feed the WDT within this window
+// the chip hard-resets itself instead of staying bricked. See the WDT setup in
+// setup() and the per-pass feed in loop().
+constexpr uint32_t WDT_TIMEOUT_S = 8;
+
 /// Light-strip FX
 /// - - - - - - - - - - - -
 /// The BLE callbacks only raise a flag + the color; loop() runs the whole
@@ -1480,6 +1485,17 @@ void setup() {
     Serial.println("MODEM_FATAL Bluefruit.begin() FAILED — SoftDevice RAM/config "
                    "overflow. BLE is DOWN. Lower the configPrphConn MTU.");
   }
+
+  // Power: enable the nRF52840's buck (DC/DC) regulator now that the SoftDevice
+  // is up. The chip boots on the less efficient LDO; switching to DC/DC roughly
+  // halves run current, so the small SuperMini cell sags into brownout far later
+  // when the puck sits idle and advertising. Goes through the SoftDevice SVC (NOT
+  // a direct NRF_POWER write) because the POWER peripheral is SD-restricted while
+  // BLE is enabled. Requires the board's DC/DC inductors to be populated — they
+  // are on the SuperMini/Nice!Nano reference design; on a board without them this
+  // call still returns OK but has no effect.
+  sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
+
   Bluefruit.setTxPower(4);
   Bluefruit.setName(DEVICE_NAME);
   Bluefruit.Periph.setConnectCallback(connectCallback);
@@ -1640,6 +1656,25 @@ void setup() {
   if (!Bluefruit.Advertising.start(0))         // 0 = advertise forever (R5: log a failure)
     Serial.println("[SDERR] Advertising.start failed (setup)");
 
+  // Watchdog: last line of defense against the idle-brick. If the chip ever hangs
+  // — a brownout latch as the cell sags, or a HardFault/SoftDevice assert whose
+  // handler spins forever — nothing else recovers it and the board stays dead
+  // (BLE down, USB-CDC gone) until a manual RST. The WDT turns that permanent
+  // brick into an automatic ~8 s reset. Configured to keep counting through WFE
+  // sleep (so a hung-but-sleeping CPU still resets) but PAUSE under a debugger
+  // halt. 8 s is comfortably longer than the worst-case loop gap: while
+  // advertising the loop wakes at least every ~152 ms (adv interval) plus the
+  // RTOS systick, and loop() feeds it every pass. Started LAST so the one-time
+  // setup work (flash mount, BLE begin, first battery sample) can't trip it.
+  // NOTE: once TASKS_START fires the WDT cannot be stopped or reconfigured until
+  // a reset — so CRV/CONFIG/RREN are all set before starting, and never touched
+  // again.
+  NRF_WDT->CONFIG   = (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos) |
+                      (WDT_CONFIG_SLEEP_Run  << WDT_CONFIG_SLEEP_Pos);
+  NRF_WDT->CRV      = (WDT_TIMEOUT_S * 32768) - 1;   // 32.768 kHz LFCLK ticks
+  NRF_WDT->RREN     = WDT_RREN_RR0_Msk;              // arm reload register 0
+  NRF_WDT->TASKS_START = 1;
+
   // Start Idle with an empty session; the first connection creates one.
   g_session  = Session{};
   CURR_STATE = State::Idle;
@@ -1647,6 +1682,11 @@ void setup() {
 
 void loop() {
   const uint32_t now = millis();
+
+  // Feed the watchdog (see setup()): every healthy pass reloads it. If the loop
+  // ever stops running — hang, fault, or brownout latch — the reload stops and
+  // the WDT resets the chip after WDT_TIMEOUT_S instead of leaving it bricked.
+  NRF_WDT->RR[0] = WDT_RR_RR_Reload;
 
   // Pump the per-slot ANCS clients: issue any pending Control Point attribute
   // fetches (non-blocking). Callbacks only parse/enqueue; the work happens here.
@@ -1869,4 +1909,13 @@ void loop() {
         break;
     }
   }
+
+  // Idle: sleep the CPU until the next event instead of spinning. waitForEvent()
+  // issues the SoftDevice-aware __WFE wait, so between BLE events / the RTOS
+  // systick the core halts at low power rather than burning current in a tight
+  // busy loop — the main driver of the overnight battery sag that browned the
+  // puck out. All timing here is millis()-delta based, so waking on each tick
+  // (~1 ms) keeps FX and notify cadence unchanged. The radio still wakes the CPU
+  // every advertising interval (≤152 ms), well within the WDT window above.
+  waitForEvent();
 }
